@@ -92,6 +92,103 @@ def test_classify_incoming(text, forwarded, has_task, expected):
     assert daily.classify_incoming(text, forwarded=forwarded, has_open_task=has_task) == expected
 
 
+
+# ---- дельта (р): уточнение для длинного английского без слова + stale /next ----
+
+LONG_PROMO = "Our new release ships faster builds and better caching for everyone"
+
+
+@pytest.mark.parametrize("text, target, stale, expected", [
+    ("I gave them a heads-up before the release, as usual", "a heads-up", False, "answer"),
+    ("I gave them A HEADS-UP before the release, as usual", "a heads-up", False, "answer"),
+    (LONG_PROMO, "a heads-up", False, "clarify"),                 # 6+ слов без цели
+    ("one two three four five six", "span", False, "clarify"),    # ровно 6 — порог включён
+    ("one two three four five", "span", False, "answer"),         # 5 слов — оценка как раньше
+    ("I forgot it", "span", False, "answer"),                     # короткий неверный ответ
+    ("They span the river with a bridge every year", "span", True, "clarify"),   # stale — всегда
+    ("span", "span", True, "clarify"),
+    (LONG_PROMO, None, False, "answer"),                          # target неизвестен — как раньше
+    ("не помню", "span", True, "giveup"),                         # giveup раньше stale
+    ("anything at all goes here for sure", "span", True, "capture"),  # без задания — сбор
+])
+def test_classify_incoming_target_and_stale(text, target, stale, expected):
+    has_task = expected != "capture"
+    assert daily.classify_incoming(text, forwarded=False, has_open_task=has_task,
+                                   target=target, stale=stale) == expected
+
+
+def test_classify_incoming_forwarded_and_plus_beat_stale():
+    assert daily.classify_incoming("x", forwarded=True, has_open_task=True,
+                                   target="span", stale=True) == "capture"
+    assert daily.classify_incoming("+ span", forwarded=False, has_open_task=True,
+                                   target="span", stale=True) == "capture"
+    assert daily.classify_incoming("/next", forwarded=False, has_open_task=True,
+                                   target="span", stale=True) == "ignore"
+
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Please give a heads-up to the whole team today", "answer"),     # только слово карточки
+    ("Yesterday I GAVE A HEADS-UP to the whole team", "answer"),      # только форма
+    ("Our new release ships faster builds and better caching", "clarify"),  # ни того, ни другого
+])
+def test_classify_incoming_any_of_several_targets(text, expected):
+    targets = ("gave a heads-up", "give a heads-up")
+    assert daily.classify_incoming(text, forwarded=False, has_open_task=True,
+                                   target=targets) == expected
+
+
+def test_classify_incoming_empty_targets_behave_like_none():
+    long = "Our new release ships faster builds and better caching"
+    assert daily.classify_incoming(long, forwarded=False, has_open_task=True, target=()) == "answer"
+    assert daily.classify_incoming(long, forwarded=False, has_open_task=True,
+                                   target=(None, "")) == "answer"
+
+def test_clarify_min_words_and_ttl_constants():
+    from datetime import timedelta
+    assert daily.CLARIFY_MIN_WORDS == 6
+    assert daily.NEXT_TASK_TTL == timedelta(minutes=15)
+
+
+def _t(*, morning, issued_at):
+    return {"morning": int(morning), "issued_at": issued_at}
+
+
+def test_is_stale():
+    from datetime import timedelta, timezone
+    now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+    iso = lambda m: (now - timedelta(minutes=m)).isoformat()
+    assert daily.is_stale(_t(morning=True, issued_at=iso(600)), now) is False   # утро — никогда
+    assert daily.is_stale(_t(morning=False, issued_at=None), now) is False      # старые строки
+    assert daily.is_stale(_t(morning=False, issued_at=iso(14)), now) is False
+    assert daily.is_stale(_t(morning=False, issued_at=iso(15)), now) is True
+    assert daily.is_stale(_t(morning=False, issued_at=iso(60)), now) is True
+
+
+
+def test_is_stale_naive_issued_at_is_treated_as_utc():
+    from datetime import timedelta, timezone
+    now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+    naive = lambda m: (now - timedelta(minutes=m)).replace(tzinfo=None).isoformat()
+    assert daily.is_stale(_t(morning=False, issued_at=naive(15)), now) is True
+    assert daily.is_stale(_t(morning=False, issued_at=naive(14)), now) is False
+
+
+def test_is_stale_malformed_issued_at_is_not_stale_and_warns(caplog):
+    from datetime import timezone
+    now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+    with caplog.at_level("WARNING", logger="daily"):
+        assert daily.is_stale({"id": 9001, "morning": 0, "issued_at": "yesterday-ish"}, now) is False
+        assert daily.is_stale({"id": 9001, "morning": 0, "issued_at": "yesterday-ish"}, now) is False
+    warns = [r for r in caplog.records if "issued_at" in r.getMessage()]
+    assert len(warns) == 1                                   # одно предупреждение на задачу
+
+def test_utcnow_is_aware_utc():
+    from datetime import timezone
+    assert daily._utcnow().tzinfo is not None
+    assert daily._utcnow().utcoffset() == timezone.utc.utcoffset(None)
+
+
 def test_strip_capture_prefix():
     assert daily.strip_capture_prefix("+ heads-up") == "heads-up"
     assert daily.strip_capture_prefix("+heads-up") == "heads-up"

@@ -134,6 +134,10 @@ python bot.py               # long-polling
 - `daily_tasks.status='grading'` на старте — зомби, снимается `release_stale_grading`;
   `DAILY_AT` вне 05:00–13:59 — WARNING в логе, не ошибка; `generate_json` отдаёт только
   dict — массивы заворачивать в объект.
+- Daily (en): задание от `/next`/«Ещё одно» через 15 мин (`daily.NEXT_TASK_TTL`, колонка
+  `daily_tasks.issued_at` ISO UTC, NULL у старых строк = свежее) — режим «переспросить»:
+  любой текст → кнопки «Ответ / Новое слово», а `/next` выдаёт новое; утренние не стареют.
+  Плюс английский ≥ 6 слов без слова задания тоже переспрашивается (дельта (р) спеки).
 - Synchronous Gemini-клиент в async-хендлерах обёрнут в `asyncio.to_thread` —
   не разворачивай обратно в прямой вызов, иначе loop блокируется на ~1–5 с на запрос.
 - Колонки cards переименованы на нейтральные (word/translation/example/example_translation,

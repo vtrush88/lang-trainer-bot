@@ -368,3 +368,59 @@ async def test_morning_expires_zombie_grading_from_previous_day(conn, fake_llm, 
     assert db.get_task(conn, old)["status"] == "expired"
     assert db.open_task(conn, U)["id"] != old
     assert db.release_stale_grading(conn) == 0     # следующему старту нечего «воскрешать»
+
+
+# ---- дельта (р): /next через 15 минут выдаёт новое ----
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+T0 = datetime(2026, 10, 5, 10, 0, tzinfo=timezone.utc)
+
+
+def _open_next_task(conn, cid, *, minutes_ago, morning=False):
+    return db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence=GOOD["sentence"],
+                          sentence_ru="r", phrase_form="a heads-up", from_example=False, today=TODAY,
+                          morning=morning, issued_at=T0 - timedelta(minutes=minutes_ago))
+
+
+async def test_next_with_stale_task_expires_it_and_sends_new(conn, fake_llm, fake_tts, monkeypatch):
+    monkeypatch.setattr(daily, "_utcnow", lambda: T0)
+    cid = _card(conn)
+    old = _open_next_task(conn, cid, minutes_ago=15)
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1), morning=False)
+    assert out == "sent"
+    assert db.get_task(conn, old)["status"] == "expired"
+    new = db.open_task(conn, U)
+    assert new["id"] != old and new["issued_at"] == T0.isoformat()
+    assert db.get_daily_state(conn, U)["missed_streak"] == 0
+
+
+async def test_next_with_fresh_task_resends(conn, fake_llm, fake_tts, monkeypatch):
+    monkeypatch.setattr(daily, "_utcnow", lambda: T0)
+    cid = _card(conn)
+    tid = _open_next_task(conn, cid, minutes_ago=14)
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      morning=False)
+    assert out == "resent" and db.open_task(conn, U)["id"] == tid
+
+
+async def test_next_with_old_morning_task_resends(conn, fake_llm, fake_tts, monkeypatch):
+    monkeypatch.setattr(daily, "_utcnow", lambda: T0)
+    cid = _card(conn)
+    tid = _open_next_task(conn, cid, minutes_ago=300, morning=True)
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      morning=False)
+    assert out == "resent" and db.get_task(conn, tid)["status"] == "open"
+
+
+async def test_limit_still_wins_over_stale(conn, fake_llm, fake_tts, monkeypatch):
+    monkeypatch.setattr(daily, "_utcnow", lambda: T0)
+    cid = _card(conn)
+    for _ in range(2):
+        t = _open_next_task(conn, cid, minutes_ago=60)
+        db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    stale = _open_next_task(conn, cid, minutes_ago=60)
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      morning=False, limit=daily.MAX_TASKS_PER_DAY)
+    assert out == "limit" and db.get_task(conn, stale)["status"] == "open"

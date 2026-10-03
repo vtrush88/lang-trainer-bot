@@ -182,8 +182,13 @@ async def on_free_text(message: Message, state: FSMContext, conn: sqlite3.Connec
                        profile: LanguageProfile) -> None:
     uid = message.from_user.id
     task = db.open_task(conn, uid)   # снимок ДО лока: ответ идёт именно этой задаче
+    targets, stale = (), False
+    if task is not None:   # дельта (р): длинный текст без слова / просроченное /next → переспросить
+        card = db.get_card(conn, task["card_id"])
+        targets = (task["phrase_form"], card["word"] if card is not None else None)
+        stale = daily.is_stale(task, daily._utcnow())
     verdict = daily.classify_incoming(message.text, forwarded=message.forward_origin is not None,
-                                      has_open_task=task is not None)
+                                      has_open_task=task is not None, target=targets, stale=stale)
     if verdict == "ignore":
         return
     if verdict == "capture":

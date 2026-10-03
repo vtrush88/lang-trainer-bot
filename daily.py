@@ -14,7 +14,7 @@ import re
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
@@ -34,6 +34,8 @@ MISSED_QUIET_AFTER = 3
 QUIET_PERIOD_DAYS = 7
 WORD_RATIO = 0.8
 GIVEUP_MAX_WORDS = 4
+CLARIFY_MIN_WORDS = 6                    # длинный английский без слова задания → переспросить
+NEXT_TASK_TTL = timedelta(minutes=15)    # /next и «Ещё одно» после этого — «переспросить»
 
 _KIND_BY_RUNG = {0: "compose_hinted", 1: "gap", 3: "recall", 7: "listen", 14: "compose"}
 _MIXED_KINDS = ("recall", "gap", "listen", "compose")
@@ -95,8 +97,51 @@ def listen_ok(answer: str, sentence: str) -> bool:
 _CYRILLIC = re.compile("[а-яё]", re.IGNORECASE)
 
 
-def classify_incoming(text: str, *, forwarded: bool, has_open_task: bool) -> str:
-    """Что делать со свободным текстом вне режимов (см. спеку, «Хендлеры»)."""
+def _utcnow() -> datetime:
+    """Текущее aware-время UTC; модульная функция — тесты подменяют её monkeypatch'ем."""
+    return datetime.now(timezone.utc)
+
+
+_bad_issued_at_warned: set = set()   # id задач, про битый issued_at уже предупредили
+
+
+def is_stale(task, now: datetime) -> bool:
+    """Задание от /next или «Ещё одно» старше NEXT_TASK_TTL. Утренние — никогда (ждут весь
+    день); issued_at NULL (строки до дельты (р)) — не stale; naive-время считаем UTC;
+    нечитаемая строка — не stale (одно предупреждение в лог на задачу)."""
+    if task["morning"] or not task["issued_at"]:
+        return False
+    try:
+        issued = datetime.fromisoformat(task["issued_at"])
+    except ValueError:
+        key = task["id"]
+        if key not in _bad_issued_at_warned:
+            _bad_issued_at_warned.add(key)
+            log.warning("task %s: malformed issued_at %r — treated as not stale",
+                        key, task["issued_at"])
+        return False
+    if issued.tzinfo is None:
+        issued = issued.replace(tzinfo=timezone.utc)
+    return now - issued >= NEXT_TASK_TTL
+
+
+def _mentions_any(text: str, target: str | Iterable[str | None] | None) -> bool | None:
+    """Есть ли в тексте хоть одна цель (без учёта регистра). None — целей нет вовсе."""
+    targets = [target] if isinstance(target, str) else list(target or ())
+    targets = [t for t in targets if t]
+    if not targets:
+        return None
+    return any(sentences.contains(text, t) for t in targets)
+
+
+def classify_incoming(text: str, *, forwarded: bool, has_open_task: bool,
+                      target: str | Iterable[str | None] | None = None,
+                      stale: bool = False) -> str:
+    """Что делать со свободным текстом вне режимов (см. спеку, «Хендлеры», дельта (р)).
+
+    target — цель задания: строка или несколько (phrase_form задачи и слово карточки);
+    текст «содержит цель», если в нём есть любая из них. stale — задача просрочена (is_stale).
+    """
     t = text.strip()
     if not t or t.startswith("/"):
         return "ignore"
@@ -107,6 +152,10 @@ def classify_incoming(text: str, *, forwarded: bool, has_open_task: bool) -> str
     if intents.is_giveup(t) and len(t.split()) <= GIVEUP_MAX_WORDS:
         return "giveup"
     if _CYRILLIC.search(t):
+        return "clarify"
+    if stale:
+        return "clarify"
+    if _mentions_any(t, target) is False and len(t.split()) >= CLARIFY_MIN_WORDS:
         return "clarify"
     return "answer"
 
@@ -375,18 +424,21 @@ async def send_daily_task(bot, conn, llm, profile, user_id: int, today: date,
                 if was_morning:
                     db.bump_missed(conn, user_id)
             else:
-                card = db.get_card(conn, active["card_id"])
-                if card is not None:
-                    try:
-                        final_kind = await deliver(bot, conn, profile, user_id,
-                                                   _prepared_from_task(active), card)
-                    except TELEGRAM_SEND_ERRORS as exc:
-                        log.warning("resend to %s failed: %s", user_id, exc)
-                        return "failed"
-                    if final_kind != active["kind"]:
-                        db.set_task_kind(conn, active["id"], final_kind)
-                    return "resent"
-                db.expire_task(conn, active["id"])   # карточка удалена — задача мертва
+                # /next через 15 минут: старое тихо истекает (не утреннее — без bump), выдаём новое
+                replaced = is_stale(active, _utcnow()) and db.expire_task(conn, active["id"]) is not None
+                if not replaced:
+                    card = db.get_card(conn, active["card_id"])
+                    if card is not None:
+                        try:
+                            final_kind = await deliver(bot, conn, profile, user_id,
+                                                       _prepared_from_task(active), card)
+                        except TELEGRAM_SEND_ERRORS as exc:
+                            log.warning("resend to %s failed: %s", user_id, exc)
+                            return "failed"
+                        if final_kind != active["kind"]:
+                            db.set_task_kind(conn, active["id"], final_kind)
+                        return "resent"
+                    db.expire_task(conn, active["id"])   # карточка удалена — задача мертва
         if morning:
             st = db.get_daily_state(conn, user_id)
             if not should_send(st["missed_streak"], st["last_sent_on"], today):
@@ -403,7 +455,7 @@ async def send_daily_task(bot, conn, llm, profile, user_id: int, today: date,
         db.create_task(conn, user_id=user_id, card_id=card["id"], kind=final_kind,
                        sentence=prepared.sentence, sentence_ru=prepared.sentence_ru,
                        phrase_form=prepared.phrase_form, from_example=prepared.from_example,
-                       today=today, morning=morning)
+                       today=today, morning=morning, issued_at=_utcnow())
         log.info("daily task for %s: card %s, kind %s%s", user_id, card["id"], final_kind,
                  " (morning)" if morning else "")
         if morning:

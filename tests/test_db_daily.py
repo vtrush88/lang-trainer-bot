@@ -255,3 +255,68 @@ def test_daily_state_counters(conn):
     assert st["missed_streak"] == 0 and st["last_sent_on"] == "2026-10-05"
     db.reset_missed(conn, 777)  # на несуществующем — не падает
     assert db.get_daily_state(conn, 777)["missed_streak"] == 0
+
+
+# ---- дельта (р): issued_at ----
+
+OLD_DAILY_TASKS_NO_ISSUED_AT = """
+CREATE TABLE daily_tasks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    card_id        INTEGER NOT NULL,
+    kind           TEXT NOT NULL,
+    sentence       TEXT,
+    sentence_ru    TEXT,
+    phrase_form    TEXT,
+    reply_sentence TEXT,
+    from_example   INTEGER NOT NULL DEFAULT 0,
+    sent_on        TEXT NOT NULL,
+    morning        INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'open',
+    answered_ok    INTEGER
+);
+"""
+
+
+def test_fresh_db_has_issued_at(conn):
+    assert "issued_at" in _columns(conn, "daily_tasks")
+
+
+def test_migration_adds_issued_at_to_old_daily_tasks(tmp_path):
+    conn = db.connect(str(tmp_path / "old.db"))
+    conn.executescript(OLD_SCHEMA_NO_CONTEXT + OLD_DAILY_TASKS_NO_ISSUED_AT)
+    conn.execute("INSERT INTO daily_tasks (user_id, card_id, kind, sent_on)"
+                 " VALUES (1, 1, 'gap', '2026-10-01')")
+    conn.commit()
+    db.init_db(conn)
+    assert "issued_at" in _columns(conn, "daily_tasks")
+    assert conn.execute("SELECT issued_at FROM daily_tasks").fetchone()["issued_at"] is None
+    db.init_db(conn)  # идемпотентно
+    assert "issued_at" in _columns(conn, "daily_tasks")
+
+
+def test_migration_on_db_without_daily_tasks_is_noop(tmp_path):
+    conn = db.connect(str(tmp_path / "old.db"))
+    conn.executescript(OLD_SCHEMA_NO_CONTEXT)   # прод до daily practice: таблицы задач нет
+    db.init_db(conn)
+    assert "issued_at" in _columns(conn, "daily_tasks")
+
+
+def test_create_task_writes_iso_utc_issued_at(conn):
+    from datetime import datetime, timedelta, timezone
+    cid = _add(conn, "a heads-up")
+    before = datetime.now(timezone.utc)
+    tid = _task(conn, cid)
+    stamp = datetime.fromisoformat(db.get_task(conn, tid)["issued_at"])
+    assert stamp.utcoffset() == timedelta(0)
+    assert before - timedelta(seconds=1) <= stamp <= datetime.now(timezone.utc)
+
+
+def test_create_task_accepts_explicit_issued_at(conn):
+    from datetime import datetime, timezone
+    cid = _add(conn, "a heads-up")
+    at = datetime(2026, 10, 3, 9, 30, tzinfo=timezone.utc)
+    tid = db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence=None,
+                         sentence_ru=None, phrase_form=None, from_example=False,
+                         today=D0, morning=False, issued_at=at)
+    assert db.get_task(conn, tid)["issued_at"] == at.isoformat()

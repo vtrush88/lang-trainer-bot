@@ -514,3 +514,112 @@ async def test_end_session_without_seq_equals_plain_clear():
     await state.set_state(Training.flashcards)
     await end_session(state)
     assert await state.get_state() is None and await state.get_data() == {}
+
+
+# ---- дельта (р): длинный английский без слова / stale-задача → уточнение ----
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+PROMO = "Our new release ships faster builds and better caching for everyone"
+
+
+def _next_task(conn, cid, *, phrase_form=None, issued_at=None):
+    return db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence="S", sentence_ru="r",
+                          phrase_form=phrase_form, from_example=False, today=TODAY, morning=False,
+                          issued_at=issued_at)
+
+
+def _assert_clarified(message, state, answer, text, tid):
+    answer.assert_not_awaited()
+    assert state.data["pending"][str(state.data["seq"])] == {"text": text, "task_id": tid}
+    assert message.answer.await_args.args[0] == daily.TEXT_CLARIFY
+    kb = message.answer.await_args.kwargs["reply_markup"].inline_keyboard[0]
+    assert [b.callback_data.split(":")[1] for b in kb] == ["answer", "capture"]
+
+
+async def test_free_text_long_english_without_word_asks_to_clarify(conn, monkeypatch):
+    answer = AsyncMock()
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="span"))
+    state, message = DictState(), _message(PROMO)
+    await daily_handlers.on_free_text(message, state, conn, None, EN)
+    _assert_clarified(message, state, answer, PROMO, tid)
+
+
+async def test_free_text_text_with_card_word_but_not_phrase_form_is_graded(conn, monkeypatch):
+    answer = AsyncMock(return_value="done")
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="give a heads-up"), phrase_form="gave a heads-up",
+                     issued_at=datetime.now(timezone.utc))
+    message = _message("Please GIVE A HEADS-UP to the whole team today")   # слово есть, формы нет
+    await daily_handlers.on_free_text(message, _state({}), conn, None, EN)
+    assert answer.await_args.kwargs == {"giveup": False, "task_id": tid}
+    message.answer.assert_not_awaited()
+
+
+async def test_free_text_text_with_phrase_form_but_not_card_word_is_graded(conn, monkeypatch):
+    answer = AsyncMock(return_value="done")
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="give a heads-up"), phrase_form="gave a heads-up",
+                     issued_at=datetime.now(timezone.utc))
+    await daily_handlers.on_free_text(_message("Yesterday I gave a heads-up to the whole team"),
+                                      _state({}), conn, None, EN)
+    assert answer.await_args.kwargs == {"giveup": False, "task_id": tid}
+
+
+async def test_free_text_long_text_with_neither_form_nor_word_clarifies(conn, monkeypatch):
+    answer = AsyncMock()
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="give a heads-up"), phrase_form="gave a heads-up",
+                     issued_at=datetime.now(timezone.utc))
+    state, message = DictState(), _message(PROMO)
+    await daily_handlers.on_free_text(message, state, conn, None, EN)
+    _assert_clarified(message, state, answer, PROMO, tid)
+
+
+async def test_free_text_long_english_with_word_goes_to_grading(conn, monkeypatch):
+    answer = AsyncMock(return_value="done")
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="span"), issued_at=datetime.now(timezone.utc))
+    await daily_handlers.on_free_text(_message("The old bridge can SPAN the whole river"),
+                                      _state({}), conn, None, EN)
+    assert answer.await_args.kwargs == {"giveup": False, "task_id": tid}
+
+
+async def test_free_text_stale_task_asks_to_clarify_even_with_word(conn, monkeypatch):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(daily, "_utcnow", lambda: now)
+    answer = AsyncMock()
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="span"), issued_at=now - timedelta(minutes=15))
+    text = "bridges span rivers"
+    state, message = DictState(), _message(text)
+    await daily_handlers.on_free_text(message, state, conn, None, EN)
+    _assert_clarified(message, state, answer, text, tid)
+
+
+async def test_free_text_short_answer_without_word_still_graded(conn, monkeypatch):
+    answer = AsyncMock(return_value="done")
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="span"), issued_at=datetime.now(timezone.utc))
+    message = _message("I forgot it")
+    await daily_handlers.on_free_text(message, _state({}), conn, None, EN)
+    assert answer.await_args.kwargs == {"giveup": False, "task_id": tid}
+    message.answer.assert_not_awaited()
+
+
+async def test_stale_task_answer_via_clarify_button_is_graded(conn, monkeypatch):
+    """Опоздавший ответ не теряется: «Ответ» → answer_task по сохранённому task_id."""
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(daily, "_utcnow", lambda: now)
+    answer = AsyncMock(return_value="done")
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _next_task(conn, _card(conn, word="span"), issued_at=now - timedelta(hours=2))
+    state = DictState()
+    await daily_handlers.on_free_text(_message("bridges span rivers"), state, conn, None, EN)
+    seq = state.data["seq"]
+    call = _call(f"clarify:answer:{seq}")
+    await daily_handlers.on_clarify(call, state, conn, None, EN)
+    assert answer.await_args.kwargs == {"giveup": False, "task_id": tid}
+    assert answer.await_args.args[5] == "bridges span rivers"
+    call.message.answer.assert_not_awaited()

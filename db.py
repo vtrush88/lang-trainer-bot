@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timezone
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS daily_tasks (
     sent_on        TEXT NOT NULL,
     morning        INTEGER NOT NULL DEFAULT 0,
     status         TEXT NOT NULL DEFAULT 'open',
-    answered_ok    INTEGER
+    answered_ok    INTEGER,
+    issued_at      TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS daily_tasks_one_open
     ON daily_tasks(user_id) WHERE status = 'open';
@@ -76,7 +77,8 @@ def connect(path: str) -> sqlite3.Connection:
 
 
 _ADDED_COLUMNS = (
-    ("context", "TEXT"),
+    ("cards", "context", "TEXT"),
+    ("daily_tasks", "issued_at", "TEXT"),   # ISO UTC; NULL у старых строк = «не stale»
 )
 
 
@@ -85,12 +87,12 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
 
     Идемпотентно: гард по PRAGMA, DDL автокоммитится — транзакции нет.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(cards)")}
-    if not cols:
-        return  # свежая база: CREATE TABLE уже содержит новые колонки
-    for name, ddl in _ADDED_COLUMNS:
+    for table, name, ddl in _ADDED_COLUMNS:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not cols:
+            continue  # таблицы ещё нет: CREATE TABLE из SCHEMA создаст её сразу с колонкой
         if name not in cols:
-            conn.execute(f"ALTER TABLE cards ADD COLUMN {name} {ddl}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -241,15 +243,18 @@ def create_task(
     conn: sqlite3.Connection, *, user_id: int, card_id: int, kind: str,
     sentence: str | None, sentence_ru: str | None, phrase_form: str | None,
     from_example: bool, today: date, morning: bool,
+    issued_at: datetime | None = None,
 ) -> int:
+    """issued_at — момент выдачи (aware UTC); по умолчанию сейчас. Пишется ISO-строкой."""
+    stamp = (issued_at or datetime.now(timezone.utc)).isoformat()
     cur = conn.execute(
         """
         INSERT INTO daily_tasks (user_id, card_id, kind, sentence, sentence_ru,
-                                 phrase_form, from_example, sent_on, morning)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 phrase_form, from_example, sent_on, morning, issued_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (user_id, card_id, kind, sentence, sentence_ru, phrase_form,
-         int(from_example), today.isoformat(), int(morning)),
+         int(from_example), today.isoformat(), int(morning), stamp),
     )
     conn.commit()
     return int(cur.lastrowid)
