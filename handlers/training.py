@@ -39,7 +39,7 @@ async def _show_next_flashcard(
     await state.update_data(queue=queue)
     if not queue:
         await end_session(state)
-        await message.answer("Все слова повторены — ты молодец! ❤️", reply_markup=keyboards.main_menu())
+        await message.answer("Все слова повторены — ты молодец! ❤️", reply_markup=keyboards.menu_markup(profile))
         return
     await message.answer(f"🎴 {card['word']}")
     await voice.send_card_voice(message, conn, card, profile.tts_voice)
@@ -118,7 +118,7 @@ async def _ask_next_translation(
     if not queue:
         await end_session(state)
         await message.answer("Все слова повторены — ты молодец! ❤️",
-                             reply_markup=keyboards.main_menu())
+                             reply_markup=keyboards.menu_markup(profile))
         return
     await message.answer(profile.translate_question.format(card["translation"]))
 
@@ -231,7 +231,7 @@ async def _ask_next_listen(
     if not queue:
         await end_session(state)
         await message.answer("Все слова повторены — ты молодец! ❤️",
-                             reply_markup=keyboards.main_menu())
+                             reply_markup=keyboards.menu_markup(profile))
         return
     await message.answer("🔊 Что это за слово? Послушай и напиши:")
     await voice.send_card_voice(message, conn, card, profile.tts_voice)

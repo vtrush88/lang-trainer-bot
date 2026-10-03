@@ -7,6 +7,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 BTN_ADD = "➕ Добавить слово"
@@ -29,6 +30,14 @@ def main_menu() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+def menu_markup(profile) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
+    """Нижнее меню профиля: es — прежняя reply-клавиатура; command_menu (en) — убрать её,
+    разделы живут в командах «/»."""
+    if profile.command_menu:
+        return ReplyKeyboardRemove()
+    return main_menu()
 
 
 def reveal_keyboard() -> InlineKeyboardMarkup:

@@ -23,13 +23,16 @@ async def cmd_start(
     message: Message, state: FSMContext, profile: LanguageProfile
 ) -> None:
     await leave_modes(state)  # /start is a clean reset
-    await message.answer(profile.greeting, reply_markup=keyboards.main_menu())
+    await message.answer(profile.greeting, reply_markup=keyboards.menu_markup(profile))
 
 
-def _render_page(conn: sqlite3.Connection, user_id: int, page: int):
+def _render_page(conn: sqlite3.Connection, user_id: int, page: int,
+                 profile: LanguageProfile):
     """Render one vocab page; clamps page after deletions shrink the list."""
     total = db.count_cards(conn, user_id)
     if total == 0:
+        if profile.command_menu:
+            return "Словарь пуст. Добавь первое слово через /add.", None
         return "Словарь пуст. Добавь первое слово через «➕ Добавить слово».", None
     pages = (total + keyboards.PAGE_SIZE - 1) // keyboards.PAGE_SIZE
     page = max(0, min(page, pages - 1))
@@ -44,10 +47,11 @@ def _render_page(conn: sqlite3.Connection, user_id: int, page: int):
 
 @router.message(F.text == keyboards.BTN_VOCAB)
 async def show_vocab(
-    message: Message, state: FSMContext, conn: sqlite3.Connection
+    message: Message, state: FSMContext, conn: sqlite3.Connection,
+    profile: LanguageProfile,
 ) -> None:
     await leave_modes(state)  # «Мой словарь» leaves any active mode (add or training)
-    text, kb = _render_page(conn, message.from_user.id, 0)
+    text, kb = _render_page(conn, message.from_user.id, 0, profile)
     await message.answer(text, reply_markup=kb)
 
 
@@ -66,12 +70,13 @@ async def _remove_card_voice(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("vocab:"))
 async def paginate_vocab(
-    call: CallbackQuery, state: FSMContext, conn: sqlite3.Connection
+    call: CallbackQuery, state: FSMContext, conn: sqlite3.Connection,
+    profile: LanguageProfile,
 ) -> None:
     """Page navigation; also the «back to list» button on a card."""
     await _remove_card_voice(call, state)
     page = int(call.data.split(":")[1])
-    text, kb = _render_page(conn, call.from_user.id, page)
+    text, kb = _render_page(conn, call.from_user.id, page, profile)
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer()
 
@@ -85,7 +90,7 @@ async def show_card(
     _, card_id, page = call.data.split(":")
     card = db.get_card(conn, int(card_id))
     if card is None:
-        text, kb = _render_page(conn, call.from_user.id, int(page))
+        text, kb = _render_page(conn, call.from_user.id, int(page), profile)
         await call.message.edit_text(text, reply_markup=kb)
         await call.answer("Это слово уже удалено")
         return
@@ -102,12 +107,13 @@ async def show_card(
 
 @router.callback_query(F.data.startswith("del:"))
 async def delete_word(
-    call: CallbackQuery, state: FSMContext, conn: sqlite3.Connection
+    call: CallbackQuery, state: FSMContext, conn: sqlite3.Connection,
+    profile: LanguageProfile,
 ) -> None:
     await _remove_card_voice(call, state)
     parts = call.data.split(":")
     page = int(parts[2]) if len(parts) > 2 else 0
     db.delete_card(conn, int(parts[1]), user_id=call.from_user.id)
-    text, kb = _render_page(conn, call.from_user.id, page)
+    text, kb = _render_page(conn, call.from_user.id, page, profile)
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer("Удалено")

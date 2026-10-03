@@ -198,3 +198,22 @@ def test_daily_prompts_are_gender_neutral():
     en = PROFILES["en"]
     for text in (en.sentence_system, en.sentence_check_system, en.capture_system):
         assert "Пол ученика неизвестен" in text
+
+
+def test_command_menu_flag_default_off_es_off_en_on():
+    import dataclasses
+    from languages import LanguageProfile
+    field = {f.name: f for f in dataclasses.fields(LanguageProfile)}["command_menu"]
+    assert field.default is False
+    assert PROFILES["es"].command_menu is False
+    assert PROFILES["en"].command_menu is True
+
+
+def test_en_texts_point_to_commands_not_buttons():
+    en = PROFILES["en"]
+    for cmd in ("/next", "/add", "/vocab", "/cards", "/check", "/listen"):
+        assert cmd in en.greeting, cmd
+    assert "«+»" in en.greeting   # английский текст можно прислать с «+» — бот предложит сохранить
+    assert "➕ Добавить слово" not in en.greeting and "📖 Мой словарь" not in en.greeting
+    assert "меню внизу" not in en.add_intro
+    assert "/" in en.add_intro

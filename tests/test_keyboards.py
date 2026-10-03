@@ -71,3 +71,17 @@ def test_take_and_clarify_keyboards_carry_seq():
     assert [b.callback_data for b in take] == ["take:yes:7", "take:no:7"]
     clar = keyboards.clarify_keyboard(3).inline_keyboard[0]
     assert [b.callback_data for b in clar] == ["clarify:answer:3", "clarify:capture:3"]
+
+
+def test_menu_markup_es_is_the_old_reply_keyboard():
+    from aiogram.types import ReplyKeyboardMarkup
+    from languages import PROFILES
+    kb = keyboards.menu_markup(PROFILES["es"])
+    assert isinstance(kb, ReplyKeyboardMarkup)
+    assert kb == keyboards.main_menu()   # те же кнопки, тот же resize
+
+
+def test_menu_markup_en_removes_keyboard():
+    from aiogram.types import ReplyKeyboardRemove
+    from languages import PROFILES
+    assert isinstance(keyboards.menu_markup(PROFILES["en"]), ReplyKeyboardRemove)

@@ -209,5 +209,5 @@ async def reject_non_text(message: Message) -> None:
 @router.callback_query(F.data.startswith(("more:", "take:", "clarify:")))
 async def daily_button_inside_mode(call: CallbackQuery) -> None:
     """Кнопка daily нажата внутри режима добавления/тренировки (StateFilter(None) не
-    пропустил) — не оставляем «крутилку», подсказываем выйти в меню."""
-    await call.answer("Сначала выйди из режима — нажми любую кнопку меню 🙂")
+    пропустил) — не оставляем «крутилку», подсказываем выйти командой «/» (daily — только en)."""
+    await call.answer("Сначала выйди из режима — выбери любую команду в меню «/» 🙂")

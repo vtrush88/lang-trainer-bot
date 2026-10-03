@@ -357,6 +357,8 @@ async def test_daily_button_inside_mode_answers_callback():
     await daily_handlers.daily_button_inside_mode(call)
     call.answer.assert_awaited_once()
     call.message.answer.assert_not_awaited()
+    hint = call.answer.await_args.args[0]
+    assert "«/»" in hint and "кнопку меню" not in hint   # у en-бота нет reply-кнопок, только команды
 
 
 def _has_state_none(handler) -> bool:

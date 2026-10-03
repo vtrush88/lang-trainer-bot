@@ -12,7 +12,7 @@ import config
 import daily
 import db
 import languages
-from handlers import add, menu, training
+from handlers import add, commands, menu, training
 from handlers import daily as daily_handlers
 from services import llm as llm_service
 
@@ -24,11 +24,15 @@ def prepare_db(conn) -> None:
 
 BASE_ROUTERS = (menu.router, add.router, training.router)
 DAILY_ROUTER = daily_handlers.router
+COMMANDS_ROUTER = commands.router
 
 
 def build_dispatcher(*, conn, llm, profile: languages.LanguageProfile,
-                     base_routers=BASE_ROUTERS, daily_router=DAILY_ROUTER) -> Dispatcher:
-    """Роутеры в фиксированном порядке; daily — ПОСЛЕДНИМ и только для профиля с daily_practice.
+                     base_routers=BASE_ROUTERS, daily_router=DAILY_ROUTER,
+                     commands_router=COMMANDS_ROUTER) -> Dispatcher:
+    """Роутеры в фиксированном порядке: команды «/» — ПЕРВЫМИ и только для профиля с
+    command_menu (иначе «/vocab» в режиме добавления поймает add.receive_text); daily —
+    ПОСЛЕДНИМ и только для профиля с daily_practice.
 
     Роутеры инжектируются ради тестов: aiogram не даёт подключить один Router к двум Dispatcher'ам.
     """
@@ -37,6 +41,8 @@ def build_dispatcher(*, conn, llm, profile: languages.LanguageProfile,
     dp["conn"] = conn
     dp["llm"] = llm
     dp["profile"] = profile
+    if profile.command_menu:
+        dp.include_router(commands_router)   # команды из любого режима — раньше режимных хендлеров
     for router in base_routers:
         dp.include_router(router)
     if profile.daily_practice:
@@ -49,6 +55,18 @@ def start_daily_loop(bot, conn, llm, profile, cfg) -> asyncio.Task | None:
     if not daily.should_start_loop(profile, cfg):
         return None
     return asyncio.create_task(daily.daily_loop(bot, conn, llm, profile, cfg))
+
+
+async def setup_commands(bot, profile: languages.LanguageProfile) -> None:
+    """Подсказка «/» только для профиля с command_menu; у es список команд не трогаем вовсе.
+
+    Список косметический: сбой Telegram логируем и продолжаем — старт polling не блокируем."""
+    if not profile.command_menu:
+        return
+    try:
+        await bot.set_my_commands(commands.bot_commands())
+    except Exception:
+        logging.exception("set_my_commands failed; continuing without command list")
 
 
 async def main() -> None:
@@ -77,6 +95,7 @@ async def main() -> None:
 
     daily_task = start_daily_loop(bot, conn, llm, profile, cfg)
     await bot.delete_webhook(drop_pending_updates=True)
+    await setup_commands(bot, profile)
     try:
         await dp.start_polling(bot)
     finally:
