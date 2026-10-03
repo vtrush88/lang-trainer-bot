@@ -144,3 +144,57 @@ def test_profiles_are_complete_and_wellformed():
             profile.grading_schema["properties"])
         # note: гендер-нейтральность требуется в обоих grading-промптах
         assert "Пол ученика неизвестен" in profile.grading_system
+
+
+def _schema_ok(schema):
+    assert schema["type"] == "OBJECT"
+    assert set(schema["required"]) <= set(schema["properties"])
+
+
+def test_es_profile_has_no_daily_practice():
+    es = PROFILES["es"]
+    assert es.daily_practice is False
+    assert es.sentence_system == "" and es.sentence_schema is None
+    assert es.capture_system == "" and es.capture_schema is None
+
+
+def test_en_daily_prompts_and_schemas():
+    en = PROFILES["en"]
+    assert en.daily_practice is True
+    for text in (en.sentence_system, en.sentence_check_system, en.capture_system,
+                 en.sentence_user_template, en.sentence_check_user_template):
+        assert text.strip()
+    _schema_ok(en.sentence_schema)
+    assert set(en.sentence_schema["required"]) == {"sentence", "sentence_ru", "phrase_form"}
+    _schema_ok(en.sentence_check_schema)
+    assert en.sentence_check_schema["properties"]["verdict"]["enum"] == ["good", "fix", "off"]
+    assert {"reply_sentence", "reply_phrase_form"} <= set(en.sentence_check_schema["required"])
+
+
+def test_en_capture_schema_is_object_with_items_array():
+    en = PROFILES["en"]
+    _schema_ok(en.capture_schema)
+    assert en.capture_schema["required"] == ["items"]
+    items = en.capture_schema["properties"]["items"]
+    assert items["type"] == "ARRAY"
+    item = items["items"]
+    assert item["type"] == "OBJECT"
+    assert {"word", "translation", "transcription", "example",
+            "example_translation", "context"} <= set(item["required"])
+    assert "usage" in item["properties"] and "usage" not in item["required"]
+
+
+def test_en_templates_format_with_expected_keys():
+    en = PROFILES["en"]
+    s = en.sentence_user_template.format(word="a heads-up", translation="п", context="к",
+                                         kind="gap", avoid="—")
+    assert "a heads-up" in s and "gap" in s
+    c = en.sentence_check_user_template.format(word="a heads-up", translation="п", context="к",
+                                               answer="I gave a heads-up.", avoid="—")
+    assert "I gave a heads-up." in c
+
+
+def test_daily_prompts_are_gender_neutral():
+    en = PROFILES["en"]
+    for text in (en.sentence_system, en.sentence_check_system, en.capture_system):
+        assert "Пол ученика неизвестен" in text

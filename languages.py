@@ -26,6 +26,18 @@ class LanguageProfile:
     greeting: str
     add_intro: str
     translate_question: str  # шаблон с {}
+    # --- ежедневная практика (только en; у es дефолты) ---
+    daily_practice: bool = False
+    sentence_system: str = ""
+    sentence_schema: dict | None = None
+    # .format(word=…, translation=…, context=…, kind=…, avoid=…)
+    sentence_user_template: str = ""
+    sentence_check_system: str = ""
+    sentence_check_schema: dict | None = None
+    # .format(word=…, translation=…, context=…, answer=…, avoid=…)
+    sentence_check_user_template: str = ""
+    capture_system: str = ""
+    capture_schema: dict | None = None
 
 
 ES = LanguageProfile(
@@ -112,6 +124,56 @@ ES = LanguageProfile(
     translate_question="Как по-испански: «{}»?",
 )
 
+_EN_SENTENCE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "sentence": {"type": "STRING"},
+        "sentence_ru": {"type": "STRING"},
+        "phrase_form": {"type": "STRING"},
+    },
+    "required": ["sentence", "sentence_ru", "phrase_form"],
+}
+
+_EN_SENTENCE_CHECK_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "verdict": {"type": "STRING", "enum": ["good", "fix", "off"]},
+        "corrected": {"type": "STRING"},
+        "note": {"type": "STRING"},
+        "reply_sentence": {"type": "STRING"},
+        "reply_sentence_ru": {"type": "STRING"},
+        "reply_phrase_form": {"type": "STRING"},
+    },
+    "required": ["verdict", "corrected", "note", "reply_sentence",
+                 "reply_sentence_ru", "reply_phrase_form"],
+}
+
+_EN_CAPTURE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "items": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "kind": {"type": "STRING", "enum": ["word", "phrase"]},
+                    "word": {"type": "STRING"},
+                    "translation": {"type": "STRING"},
+                    "transcription": {"type": "STRING"},
+                    "example": {"type": "STRING"},
+                    "example_translation": {"type": "STRING"},
+                    "context": {"type": "STRING"},
+                    "usage": {"type": "STRING"},
+                },
+                "required": ["kind", "word", "translation", "transcription",
+                             "example", "example_translation", "context"],
+            },
+        },
+    },
+    "required": ["items"],
+}
+
+
 EN = LanguageProfile(
     code="en",
     tts_voice="en-US-EmmaNeural",
@@ -187,6 +249,78 @@ EN = LanguageProfile(
         "Я сохраню каждое. Когда закончишь, выбери что-нибудь в меню внизу."
     ),
     translate_question="Как по-английски: «{}»?",
+    daily_practice=True,
+    sentence_system=(
+        "Ты пишешь ОДНО предложение на американском английском уровня B2 для "
+        "русскоязычного ученика, который учит фразу. Тебе дают фразу, её перевод, "
+        "контекст, откуда она пришла (тема), вид задания и список предложений, "
+        "которые НЕЛЬЗЯ повторять. Правила: предложение живое и естественное, "
+        "8–16 слов, фраза употреблена в нём точно и уместно; тема предложения — "
+        "из указанного контекста (если контекст — это пример-предложение, держись "
+        "его темы), не абстрактная и не «про кота»; для вида задания gap фраза "
+        "должна стоять в предложении дословно, чтобы её можно было вырезать. "
+        "Верни: sentence — предложение; sentence_ru — его естественный русский "
+        "перевод; phrase_form — ТОЧНАЯ подстрока sentence, в которой употреблена "
+        "фраза (с теми же буквами и формой слов, как в sentence). Не повторяй "
+        "предложения из списка «не повторять» и не делай их перефразом. "
+        "Пол ученика неизвестен — без гендерных форм в его адрес."
+    ),
+    sentence_schema=_EN_SENTENCE_SCHEMA,
+    sentence_user_template=(
+        "Фраза: {word}\n"
+        "Перевод: {translation}\n"
+        "Контекст (тема): {context}\n"
+        "Вид задания: {kind}\n"
+        "Не повторять:\n{avoid}"
+    ),
+    sentence_check_system=(
+        "Ты мягко проверяешь предложение, которое русскоязычный ученик уровня B2 "
+        "сам составил на американском английском с заданной фразой. Тебе дают "
+        "фразу, её перевод, контекст и предложение ученика. Оцени verdict: 'good' "
+        "— предложение естественное и фраза употреблена верно; 'fix' — фраза на "
+        "месте, но есть грамматическая/лексическая ошибка или неестественность; "
+        "'off' — фраза не использована, использована в другом смысле или "
+        "предложение не на английском. В corrected — исправленный вариант "
+        "предложения ученика (для 'good' повтори его как есть). В note — короткая "
+        "ДОБАВЛЯЮЩАЯ подсказка по-русски: для 'fix'/'off' — что именно не так "
+        "(«нужен артикль», «после … идёт герундий»); для 'good' — крошечный факт "
+        "или ободрение. НЕ дублируй вердикт словами «верно», «почти». Затем "
+        "напиши ответное предложение: reply_sentence — НОВОЕ предложение с той же "
+        "фразой, в теме контекста, не повторяющее ни предложение ученика, ни "
+        "список «не повторять»; reply_sentence_ru — его русский перевод; "
+        "reply_phrase_form — ТОЧНАЯ подстрока reply_sentence с фразой. "
+        "Пол ученика неизвестен — без гендерных форм в его адрес "
+        "(не «написала», «умница»)."
+    ),
+    sentence_check_schema=_EN_SENTENCE_CHECK_SCHEMA,
+    sentence_check_user_template=(
+        "Фраза: {word}\n"
+        "Перевод: {translation}\n"
+        "Контекст (тема): {context}\n"
+        "Предложение ученика: {answer}\n"
+        "Не повторять:\n{avoid}"
+    ),
+    capture_system=(
+        "Ты помогаешь русскоязычному ученику уровня B2 собирать английские фразы "
+        "из его реальной жизни. На вход — свободный текст: пересланное сообщение, "
+        "кусок переписки, заметка после созвона, возможно с пояснением по-русски. "
+        "Задача — вернуть items: от 0 до 3 фраз, которые стоит выучить. Если в "
+        "тексте есть явный указатель (одиночное слово/фраза, кавычки, «не поняла "
+        "X», «что значит X») — верни РОВНО эту фразу, одну. Иначе выбери до 3 "
+        "самых полезных для B2 кусков: коллокации, фразовые глаголы, устойчивые "
+        "обороты — НЕ одиночные частотные слова. Для каждого: kind ('word' или "
+        "'phrase'); word — фраза в словарной форме на американском английском "
+        "(a heads-up, give someone a heads-up); translation — русский перевод; "
+        "transcription — IPA в слэшах, General American; example — пример-"
+        "предложение B2+ с этой фразой; example_translation — его перевод; "
+        "context — ДО 60 символов по-русски, откуда/о чём была фраза, строго из "
+        "текста, без выдумок (например «рабочий созвон, перенос релиза»); если "
+        "источник не назван — тема самого сообщения; context не может быть "
+        "пустым. usage — короткая строка «обычно: …» с типичным употреблением "
+        "(можно пустую). Если учить нечего — items пустой. "
+        "Пол ученика неизвестен — без гендерных форм в его адрес."
+    ),
+    capture_schema=_EN_CAPTURE_SCHEMA,
 )
 
 PROFILES: dict[str, LanguageProfile] = {"es": ES, "en": EN}
