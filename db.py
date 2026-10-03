@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS cards (
     transcription  TEXT,
     example        TEXT,
     example_translation TEXT,
+    context        TEXT,
     audio_file_id  TEXT,
     enriched       INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
@@ -52,8 +53,27 @@ def connect(path: str) -> sqlite3.Connection:
     return conn
 
 
+_ADDED_COLUMNS = (
+    ("context", "TEXT"),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Добавление колонок, появившихся после первого деплоя (2026-10, daily practice).
+
+    Идемпотентно: гард по PRAGMA, DDL автокоммитится — транзакции нет.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(cards)")}
+    if not cols:
+        return  # свежая база: CREATE TABLE уже содержит новые колонки
+    for name, ddl in _ADDED_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE cards ADD COLUMN {name} {ddl}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     _migrate_column_names(conn)
+    _add_missing_columns(conn)
     conn.executescript(SCHEMA)
     conn.commit()
 
@@ -70,16 +90,18 @@ def add_card(
     example_translation: str | None,
     enriched: bool,
     today: date,
+    context: str | None = None,
 ) -> int:
     iso = today.isoformat()
     cur = conn.execute(
         """
         INSERT INTO cards (user_id, kind, word, translation, transcription,
-                           example, example_translation, enriched, created_at, due_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           example, example_translation, context, enriched,
+                           created_at, due_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (user_id, kind, word, translation, transcription, example,
-         example_translation, int(enriched), iso, iso),
+         example_translation, context, int(enriched), iso, iso),
     )
     conn.commit()
     return int(cur.lastrowid)

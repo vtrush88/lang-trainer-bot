@@ -3,22 +3,36 @@ from __future__ import annotations
 import html
 
 
+def esc(value) -> str:
+    """HTML-экранирование подстановок для parse_mode="HTML" (кавычки не трогаем)."""
+    return html.escape(str(value), quote=False)
+
+
+def field(card, key: str):
+    """Безопасно прочитать ключ из dict ИЛИ sqlite3.Row (у Row нет .get)."""
+    try:
+        return card[key]
+    except (KeyError, IndexError):
+        return None
+
+
 def card_preview(card: dict) -> str:
     """Word card as Telegram HTML — send with parse_mode="HTML".
 
     The target-language word is bold; every interpolated field is
     HTML-escaped so a literal <, > or & in the data can't break Telegram's
-    HTML parser.
+    HTML parser. «📍 контекст» печатается только здесь и только если он есть.
     """
-    def esc(value) -> str:
-        return html.escape(str(value), quote=False)
-
-    return (
+    text = (
         f"🔤 <b>{esc(card['word'])}</b>\n"
         f"🇷🇺 {esc(card['translation'])}\n"
         f"🗣 произношение: {esc(card['transcription'])}\n"
         f"📝 пример: {esc(card['example'])} — {esc(card['example_translation'])}"
     )
+    context = field(card, "context")
+    if context:
+        text += f"\n📍 контекст: {esc(context)}"
+    return text
 
 
 def answer_reveal(card: dict) -> str:

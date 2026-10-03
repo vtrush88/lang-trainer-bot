@@ -1,4 +1,8 @@
+import sqlite3
+
+import db  # noqa: F401
 import formatting
+from formatting import card_preview, esc, field
 
 
 def test_card_preview_includes_all_fields():
@@ -55,3 +59,43 @@ def test_vocab_title_plural_forms():
     assert formatting.vocab_title(0, 1, 21).endswith("(21 слово)")
     assert formatting.vocab_title(0, 1, 3).endswith("(3 слова)")
     assert formatting.vocab_title(0, 3, 11).endswith("11 слов)")
+
+
+CARD = {"word": "a heads-up", "translation": "предупреждение заранее",
+        "transcription": "/ˈhedz ʌp/", "example": "Just a heads-up.",
+        "example_translation": "Просто предупреждаю."}
+
+
+def test_card_preview_without_context_is_unchanged():
+    text = card_preview(CARD)
+    assert "📍" not in text
+    assert text == (
+        "🔤 <b>a heads-up</b>\n"
+        "🇷🇺 предупреждение заранее\n"
+        "🗣 произношение: /ˈhedz ʌp/\n"
+        "📝 пример: Just a heads-up. — Просто предупреждаю."
+    )
+
+
+def test_card_preview_with_context_adds_line():
+    text = card_preview({**CARD, "context": "созвон <QA>"})
+    assert text.endswith("\n📍 контекст: созвон &lt;QA&gt;")
+
+
+def test_card_preview_empty_context_is_skipped():
+    assert "📍" not in card_preview({**CARD, "context": ""})
+
+
+def test_esc_escapes_html_but_not_quotes():
+    assert esc("<a&b>") == "&lt;a&amp;b&gt;"
+    assert esc('say "hi"') == 'say "hi"'
+
+
+def test_field_reads_dict_and_row_safely():
+    assert field(CARD, "context") is None
+    assert field({**CARD, "context": "x"}, "context") == "x"
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT 'w' AS word").fetchone()
+    assert field(row, "word") == "w"
+    assert field(row, "context") is None
