@@ -22,6 +22,28 @@ CREATE TABLE IF NOT EXISTS cards (
     reps           INTEGER NOT NULL DEFAULT 0,
     lapses         INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS daily_tasks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    card_id        INTEGER NOT NULL,
+    kind           TEXT NOT NULL,
+    sentence       TEXT,
+    sentence_ru    TEXT,
+    phrase_form    TEXT,
+    reply_sentence TEXT,
+    from_example   INTEGER NOT NULL DEFAULT 0,
+    sent_on        TEXT NOT NULL,
+    morning        INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'open',
+    answered_ok    INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS daily_tasks_one_open
+    ON daily_tasks(user_id) WHERE status = 'open';
+CREATE TABLE IF NOT EXISTS daily_state (
+    user_id        INTEGER PRIMARY KEY,
+    missed_streak  INTEGER NOT NULL DEFAULT 0,
+    last_sent_on   TEXT
+);
 """
 
 _COLUMN_RENAMES = (
@@ -207,3 +229,90 @@ def card_exists(conn: sqlite3.Connection, user_id: int, word: str) -> bool:
         "SELECT word FROM cards WHERE user_id = ?", (user_id,)
     ).fetchall()
     return any((r["word"] or "").strip().lower() == target for r in rows)
+
+
+# --- daily practice: задания -------------------------------------------------
+
+TASK_OPEN, TASK_GRADING, TASK_ANSWERED, TASK_EXPIRED = (
+    "open", "grading", "answered", "expired")
+
+
+def create_task(
+    conn: sqlite3.Connection, *, user_id: int, card_id: int, kind: str,
+    sentence: str | None, sentence_ru: str | None, phrase_form: str | None,
+    from_example: bool, today: date, morning: bool,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO daily_tasks (user_id, card_id, kind, sentence, sentence_ru,
+                                 phrase_form, from_example, sent_on, morning)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, card_id, kind, sentence, sentence_ru, phrase_form,
+         int(from_example), today.isoformat(), int(morning)),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def get_task(conn: sqlite3.Connection, task_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM daily_tasks WHERE id = ?",
+                        (task_id,)).fetchone()
+
+
+def open_task(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
+    """Активная задача пользователя: open или grading (grading живёт секунды)."""
+    return conn.execute(
+        "SELECT * FROM daily_tasks WHERE user_id = ? AND status IN (?, ?)"
+        " ORDER BY id DESC LIMIT 1",
+        (user_id, TASK_OPEN, TASK_GRADING),
+    ).fetchone()
+
+
+def _transition(conn: sqlite3.Connection, task_id: int, src: str, dst: str,
+                extra_sql: str = "", extra_params: tuple = ()) -> bool:
+    cur = conn.execute(
+        f"UPDATE daily_tasks SET status = ?{extra_sql} WHERE id = ? AND status = ?",
+        (dst, *extra_params, task_id, src),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def claim_task(conn: sqlite3.Connection, task_id: int) -> bool:
+    return _transition(conn, task_id, TASK_OPEN, TASK_GRADING)
+
+
+def release_task(conn: sqlite3.Connection, task_id: int) -> bool:
+    return _transition(conn, task_id, TASK_GRADING, TASK_OPEN)
+
+
+def finish_task(conn: sqlite3.Connection, task_id: int, *, ok: bool,
+                reply_sentence: str | None = None) -> bool:
+    return _transition(conn, task_id, TASK_GRADING, TASK_ANSWERED,
+                       ", answered_ok = ?, reply_sentence = ?",
+                       (int(ok), reply_sentence))
+
+
+def expire_task(conn: sqlite3.Connection, task_id: int) -> bool | None:
+    """open → expired. Возвращает флаг morning истёкшей задачи, None если не была open."""
+    row = conn.execute("SELECT morning FROM daily_tasks WHERE id = ? AND status = ?",
+                       (task_id, TASK_OPEN)).fetchone()
+    if row is None:
+        return None
+    if not _transition(conn, task_id, TASK_OPEN, TASK_EXPIRED):
+        return None
+    return bool(row["morning"])
+
+
+def set_task_kind(conn: sqlite3.Connection, task_id: int, kind: str) -> None:
+    conn.execute("UPDATE daily_tasks SET kind = ? WHERE id = ?", (kind, task_id))
+    conn.commit()
+
+
+def release_stale_grading(conn: sqlite3.Connection) -> int:
+    """На старте бота: оценок в полёте нет, любой grading — зомби после падения."""
+    cur = conn.execute("UPDATE daily_tasks SET status = ? WHERE status = ?",
+                       (TASK_OPEN, TASK_GRADING))
+    conn.commit()
+    return cur.rowcount

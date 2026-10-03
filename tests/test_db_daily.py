@@ -76,3 +76,99 @@ def test_add_card_without_context_keeps_old_signature(conn):
 def test_add_card_stores_context(conn):
     cid = _add(conn, "a heads-up", context="рабочий созвон, релиз")
     assert db.get_card(conn, cid)["context"] == "рабочий созвон, релиз"
+
+
+def _task(conn, card_id, *, today=D0, morning=True, kind="gap",
+          sentence="Just a heads-up, tests are late.",
+          sentence_ru="Предупреждаю: тесты опаздывают.",
+          phrase_form="a heads-up", from_example=False, user_id=U):
+    return db.create_task(
+        conn, user_id=user_id, card_id=card_id, kind=kind, sentence=sentence,
+        sentence_ru=sentence_ru, phrase_form=phrase_form,
+        from_example=from_example, today=today, morning=morning)
+
+
+def test_daily_tables_exist(conn):
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"daily_tasks", "daily_state"} <= tables
+    assert {"morning", "from_example", "reply_sentence"} <= _columns(conn, "daily_tasks")
+
+
+def test_create_and_open_task(conn):
+    cid = _add(conn, "a heads-up")
+    assert db.open_task(conn, U) is None
+    tid = _task(conn, cid)
+    t = db.open_task(conn, U)
+    assert t["id"] == tid and t["status"] == "open" and t["morning"] == 1
+    assert t["sent_on"] == "2026-10-01"
+    assert db.open_task(conn, 999) is None  # чужого не видно
+
+
+def test_second_open_task_is_rejected_by_unique_index(conn):
+    cid = _add(conn, "a heads-up")
+    _task(conn, cid)
+    with pytest.raises(sqlite3.IntegrityError):
+        _task(conn, cid)
+
+
+def test_claim_then_second_claim_fails(conn):
+    cid = _add(conn, "a heads-up")
+    tid = _task(conn, cid)
+    assert db.claim_task(conn, tid) is True
+    assert db.get_task(conn, tid)["status"] == "grading"
+    assert db.claim_task(conn, tid) is False
+    # grading всё ещё считается активной
+    assert db.open_task(conn, U)["id"] == tid
+
+
+def test_release_only_from_grading(conn):
+    cid = _add(conn, "a heads-up")
+    tid = _task(conn, cid)
+    assert db.release_task(conn, tid) is False      # open → нельзя
+    db.claim_task(conn, tid)
+    assert db.release_task(conn, tid) is True       # grading → open
+    assert db.get_task(conn, tid)["status"] == "open"
+
+
+def test_finish_only_from_grading_and_writes_fields(conn):
+    cid = _add(conn, "a heads-up")
+    tid = _task(conn, cid)
+    assert db.finish_task(conn, tid, ok=True) is False
+    db.claim_task(conn, tid)
+    assert db.finish_task(conn, tid, ok=True, reply_sentence="Appreciate the heads-up.") is True
+    t = db.get_task(conn, tid)
+    assert t["status"] == "answered" and t["answered_ok"] == 1
+    assert t["reply_sentence"] == "Appreciate the heads-up."
+    assert db.open_task(conn, U) is None
+    # после answered можно открыть новую
+    _task(conn, cid, morning=False)
+
+
+def test_expire_returns_morning_flag_and_only_from_open(conn):
+    cid = _add(conn, "a heads-up")
+    tid = _task(conn, cid, morning=True)
+    assert db.expire_task(conn, tid) is True
+    assert db.get_task(conn, tid)["status"] == "expired"
+    assert db.expire_task(conn, tid) is None          # уже не open
+    tid2 = _task(conn, cid, morning=False)
+    assert db.expire_task(conn, tid2) is False        # не утренняя
+    tid3 = _task(conn, cid)
+    db.claim_task(conn, tid3)
+    assert db.expire_task(conn, tid3) is None         # grading не истекает
+
+
+def test_set_task_kind(conn):
+    cid = _add(conn, "a heads-up")
+    tid = _task(conn, cid, kind="listen")
+    db.set_task_kind(conn, tid, "gap")
+    assert db.get_task(conn, tid)["kind"] == "gap"
+
+
+def test_release_stale_grading_on_startup(conn):
+    cid = _add(conn, "a heads-up")
+    tid = _task(conn, cid)
+    db.claim_task(conn, tid)
+    assert db.release_stale_grading(conn) == 1
+    assert db.get_task(conn, tid)["status"] == "open"
+    assert db.release_stale_grading(conn) == 0
