@@ -30,22 +30,32 @@ Victoria для теста); данные ключуются по `user_id`.
 
 Python 3.12 · **aiogram 3.13.1** (long-polling, MemoryStorage FSM) · **SQLite** (stdlib) ·
 **google-genai 2.8.0** (`gemini-3.5-flash`, фолбэк `gemini-3.5-flash-lite` — бесплатный тир) · **edge-tts 7.2.8** (`es-ES-XimenaNeural`) ·
-python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **124 теста.**
+python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **354 теста.**
 
 ## Структура
 
 ```
-bot.py            точка входа: Dispatcher, MemoryStorage(FSM), access-filter
-                  (ALLOWED_USER_IDS), внедряет conn+llm, include_router, polling
-config.py         env: TELEGRAM_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, GEMINI_FALLBACK_MODEL, ALLOWED_USER_IDS, DB_PATH, BOT_LANG
-db.py             SQLite: cards (15 полей), CRUD, get_due_cards, card_exists (дедуп)
-languages.py     языковые профили: голос, промпты, схемы Gemini, UI-строки; выбор через BOT_LANG
+bot.py            точка входа: prepare_db, build_dispatcher(...) (access-filter ALLOWED_USER_IDS,
+                  внедряет conn+llm+profile, роутеры; daily-роутер последним и только при
+                  profile.daily_practice), start_daily_loop, polling
+config.py         env: TELEGRAM_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, GEMINI_FALLBACK_MODEL, ALLOWED_USER_IDS, DB_PATH, BOT_LANG,
+                  DAILY_AT, DAILY_TZ (дефолт Europe/Madrid), DAILY_EXCLUDE_IDS, MORNING_HOURS (05–13)
+db.py             SQLite: cards (15 полей + context), CRUD, get_due_cards, card_exists (дедуп);
+                  + daily_tasks/daily_state (жизненный цикл задания, запросы)
+languages.py     языковые профили: голос, промпты, схемы Gemini, UI-строки; выбор через BOT_LANG;
+                  + флаг daily_practice и три промпта EN (es байт-в-байт без изменений)
+daily.py          ежедневная практика (en): чистая логика + тексты, send_daily_task / answer_task /
+                  daily_loop / capture_items (IO, per-user локи)
+handlers/daily.py тонкий роутер: /next, more:, take:, clarify:, свободный текст, не-текст
+services/sentences.py  Gemini: предложение для задания + check_sentence (проверка ответа)
+services/capture.py    Gemini: извлечение фраз из пересланного текста с контекстом
 handlers/menu.py     /start, главное меню, «Мой словарь» (5/стр, тап по номеру →
                      карточка с аудио и удалением; страница ездит в callback'ах)
 handlers/add.py      добавление (залипающий режим): enrich → дедуп → превью+аудио
                      → сохранить да/нет; остаёшься в режиме, выход — кнопкой меню
 handlers/training.py 3 режима: карточки / проверка перевода / аудирование
-voice.py          общий send_card_voice: голосовое из кэша file_id или edge-tts
+voice.py          общий send_card_voice: голосовое из кэша file_id или edge-tts;
+                  send_text_voice, send_card_voice_to (+ caption/parse_mode/reply_markup)
 services/enrichment.py  Gemini structured JSON → {kind,word,translation,transcription,example,example_translation}
 services/grading.py     Gemini structured JSON → {verdict,correct,note} (мягкая проверка)
 services/llm.py         клиент Gemini + фолбэк моделей + QuotaExceededError
@@ -53,10 +63,10 @@ services/tts.py         edge-tts → MP3 (см. грабли ниже)
 services/srs.py         чистая: next_interval (Leitner-лесенка) + due_on
 session.py        чистая: advance() — политика очереди внутри сессии (повтор ошибки)
 intents.py        чистая: is_giveup() — распознать «не помню/не знаю/не поняла»
-formatting.py     чистые функции текста сообщений
-keyboards.py      reply-меню (5 кнопок) + inline-клавиатуры; константы BTN_*
-states.py         FSM-состояния AddCard / Training
-tests/            юнит-тесты (чистая логика + db + сервисы с моками; хендлеры — вручную)
+formatting.py     чистые функции текста сообщений (esc, field, «📍 контекст» в card_preview)
+keyboards.py      reply-меню (5 кнопок) + inline-клавиатуры (+ more/take/clarify); константы BTN_*
+states.py         FSM-состояния AddCard / Training + leave_modes/end_session (сохраняют seq)
+tests/            юнит-тесты (чистая логика + db + сервисы с моками; хендлеры — вызовом напрямую с моками aiogram, проводка роутеров — test_bot_wiring)
 ```
 
 **Принцип:** хендлеры тонкие, логика — в services/db/чистых модулях. Чистая логика
@@ -72,7 +82,7 @@ cp .env.example .env        # заполнить: TELEGRAM_TOKEN (@BotFather),
                             # GEMINI_API_KEY (Google AI Studio, бесплатно), ALLOWED_USER_IDS (свой tg id)
 python bot.py               # long-polling
 ```
-Тесты: `.venv/bin/pytest -q` (ожидается 124 passed).
+Тесты: `.venv/bin/pytest -q` (ожидается 354 passed).
 Секреты (`.env`), БД (`spanish_bot.db`), `.venv` — в `.gitignore`, не коммитить.
 
 **Деплой на сервер:** пошаговый ран-бук — `docs/superpowers/deploy.md`
@@ -114,6 +124,9 @@ python bot.py               # long-polling
   автоматически запускает остальные (реальный баг, пойман на телефоне 2026-06-10).
   file_id кэшируется (`sent.voice.file_id`); file_id привязан к типу сообщения — при
   смене voice↔audio кэш надо сбрасывать (`UPDATE cards SET audio_file_id = NULL`).
+- `daily_tasks.status='grading'` на старте — зомби, снимается `release_stale_grading`;
+  `DAILY_AT` вне 05:00–13:59 — WARNING в логе, не ошибка; `generate_json` отдаёт только
+  dict — массивы заворачивать в объект.
 - Synchronous Gemini-клиент в async-хендлерах обёрнут в `asyncio.to_thread` —
   не разворачивай обратно в прямой вызов, иначе loop блокируется на ~1–5 с на запрос.
 - Колонки cards переименованы на нейтральные (word/translation/example/example_translation,
@@ -127,7 +140,7 @@ python bot.py               # long-polling
   преподавателем и закрепляет лексику с уроков, поэтому словарь сугубо личный.
 - **Простота — главное ограничение** (мама почти не дружит с техникой): любую фичу
   мерить по «не усложнит ли ей». Сложное (SRS) прячем за минимум кнопок.
-- **Pull-режим**, без пуш-напоминаний (планировщика нет).
+- **es — pull-режим без пуш.** **en — одно утреннее задание в день** (`DAILY_AT` в `.env`, цепочка «Ещё одно» до 3/день, тихий режим после 3 пропусков) + сбор фраз из пересланного текста с контекстом. Спека `docs/superpowers/specs/2026-09-30-daily-practice-design.md`.
 - **Испанский Испании** (peninsular): лексика/примеры пиренейские (coche/ordenador/zumo,
   НЕ carro/computadora/jugo); голос `es-ES-XimenaNeural`. Промпт enrichment это задаёт.
 - **Транскрипция — простая, русскими буквами**, с явными правилами звуков:
@@ -160,7 +173,8 @@ python bot.py               # long-polling
 ## Статус и бэклог
 
 **Готово:** MVP собран (subagent-driven, TDD + ревью), протестирован вживую в Telegram
-(@SimpleSpanishBot), слит в `main` + вторая волна доработок 2026-06-10. 124 теста зелёных.
+(@SimpleSpanishBot), слит в `main` + вторая волна доработок 2026-06-10. 354 теста зелёных
+(124 до ежедневной практики).
 **Задеплоен на VPS (2026-06-15):** DigitalOcean Frankfurt, systemd (`Restart=always`),
 ночной бэкап через `scripts/backup-db.sh`, приватный GitHub-репо `vtrush88/lang-trainer-bot`
 (до 2026-08-04 — `spanish-bot`, переименован после появления второго бота).
@@ -195,4 +209,21 @@ python bot.py               # long-polling
   тёплый разбор от Gemini. Gemini аудио не слушает — STT-прослойка обязательна.
   Апгрейд-путь (вариант 2, потом, если захочется строже): Azure Speech Pronunciation
   Assessment — пофонемные оценки, есть бесплатный лимит.
-- Вне MVP (в спеке): пуш-напоминания, статистика прогресса.
+- Вне MVP (в спеке, для es): пуш-напоминания, статистика прогресса. (У en-бота утренняя
+  выдача есть — ежедневная практика ниже.)
+
+**Ежедневная практика «своё слово в день» (en-бот) — реализовано, не задеплоено (2026-10-03):**
+построена на ветке `daily-practice` (subagent-driven по плану, 14 задач + финальная волна фиксов, 354 теста); часть
+изменений ещё не закоммичена, в `main` не слита, на VPS не выкачена — деплой отдельным решением
+Victoria (процедура — `docs/superpowers/deploy.md`, «Ежедневная практика (en-бот)»).
+Интент `docs/superpowers/intent/daily-practice.md`, спека
+`docs/superpowers/specs/2026-09-30-daily-practice-design.md` (дельты реализации — в её «Провенансе»),
+план `docs/superpowers/plans/2026-10-02-daily-practice.md`.
+Суть: бот сам пишет утром одно задание по одной фразе (своё предложение / пропуск / вспомнить /
+услышать) в новом предложении в контексте фразы; сбор фраз пересланным текстом; цепочка «Ещё одно»
+до 3/день; тихий режим после 3 пропусков. Только `BOT_LANG=en` (гейт профилем + `DAILY_AT`);
+es-бот не меняется. Решения брейншторма («не улучшать карточки», вариант А→Б, ступени 1↔3,
+ёмкость 2 фразы/нед) — в спеке, не переоткрывать.
+Хвосты (после деплоя / на финальном ревью ветки):
+- `daily.py` ~590 строк смешивает чистую логику и IO — кандидат на разделение.
+- Текст отказа `/next` переиспользует формулировку отказа сбора фраз.

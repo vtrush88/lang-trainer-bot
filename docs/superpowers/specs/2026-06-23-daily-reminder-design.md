@@ -2,6 +2,9 @@
 
 **Date:** 2026-06-23
 **Status:** approved (brainstorm) — pending implementation plan
+**2026-09-30:** для англо-бота (`BOT_LANG=en`) заменена спекой
+`2026-09-30-daily-practice-design.md` (её таймер/DST-часть переиспользована там
+1:1 под именами `DAILY_*`); для маминого es-бота остаётся одобренной и не реализованной.
 **Components:** new `reminders.py`, `config.py`, `bot.py`, `tests/`
 
 ## Goal
