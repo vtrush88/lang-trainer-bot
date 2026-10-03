@@ -294,13 +294,21 @@ def finish_task(conn: sqlite3.Connection, task_id: int, *, ok: bool,
                        (int(ok), reply_sentence))
 
 
-def expire_task(conn: sqlite3.Connection, task_id: int) -> bool | None:
-    """open → expired. Возвращает флаг morning истёкшей задачи, None если не была open."""
-    row = conn.execute("SELECT morning FROM daily_tasks WHERE id = ? AND status = ?",
-                       (task_id, TASK_OPEN)).fetchone()
+def expire_task(conn: sqlite3.Connection, task_id: int, *,
+                include_grading: bool = False) -> bool | None:
+    """open → expired. Возвращает флаг morning истёкшей задачи, None если не истекла.
+
+    include_grading=True (только утро, под локом пользователя): grading тоже истекает —
+    под локом оценки в полёте нет, такой grading — зомби после сбоя без рестарта.
+    """
+    sources = (TASK_OPEN, TASK_GRADING) if include_grading else (TASK_OPEN,)
+    row = conn.execute(
+        f"SELECT morning, status FROM daily_tasks WHERE id = ?"
+        f" AND status IN ({', '.join('?' * len(sources))})",
+        (task_id, *sources)).fetchone()
     if row is None:
         return None
-    if not _transition(conn, task_id, TASK_OPEN, TASK_EXPIRED):
+    if not _transition(conn, task_id, row["status"], TASK_EXPIRED):
         return None
     return bool(row["morning"])
 

@@ -123,7 +123,8 @@ async def _finish_preview(call: CallbackQuery, text: str) -> None:
 
 @router.callback_query(F.data.startswith("save:yes:"))
 async def save_yes(
-    call: CallbackQuery, state: FSMContext, conn: sqlite3.Connection
+    call: CallbackQuery, state: FSMContext, conn: sqlite3.Connection,
+    profile: LanguageProfile,
 ) -> None:
     data = await state.get_data()
     pending = data.get("pending", {})
@@ -145,6 +146,8 @@ async def save_yes(
         example_translation=card["example_translation"],
         enriched=True, today=date.today(),
     )
+    if profile.daily_practice:
+        db.reset_missed(conn, call.from_user.id)  # добавила слово любым путём → тихий режим снят
     await _finish_preview(call, "Сохранено! ✅ Пиши следующее 🙂")
     await call.answer()
 

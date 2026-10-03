@@ -9,17 +9,54 @@ from google import genai
 from google.genai import types as genai_types
 
 import config
+import daily
 import db
 import languages
 from handlers import add, menu, training
+from handlers import daily as daily_handlers
 from services import llm as llm_service
+
+
+def prepare_db(conn) -> None:
+    db.init_db(conn)
+    db.release_stale_grading(conn)   # оценок в полёте на старте нет — зомби снимаем
+
+
+BASE_ROUTERS = (menu.router, add.router, training.router)
+DAILY_ROUTER = daily_handlers.router
+
+
+def build_dispatcher(*, conn, llm, profile: languages.LanguageProfile,
+                     base_routers=BASE_ROUTERS, daily_router=DAILY_ROUTER) -> Dispatcher:
+    """Роутеры в фиксированном порядке; daily — ПОСЛЕДНИМ и только для профиля с daily_practice.
+
+    Роутеры инжектируются ради тестов: aiogram не даёт подключить один Router к двум Dispatcher'ам.
+    """
+    dp = Dispatcher(storage=MemoryStorage())
+    # Inject shared deps into every handler via the data dict.
+    dp["conn"] = conn
+    dp["llm"] = llm
+    dp["profile"] = profile
+    for router in base_routers:
+        dp.include_router(router)
+    if profile.daily_practice:
+        dp.include_router(daily_router)   # ловит свободный текст вне режимов
+    return dp
+
+
+def start_daily_loop(bot, conn, llm, profile, cfg) -> asyncio.Task | None:
+    """Таймер только при обоих гейтах (профиль + DAILY_AT). Ссылку на task держит вызывающий."""
+    if not daily.should_start_loop(profile, cfg):
+        return None
+    return asyncio.create_task(daily.daily_loop(bot, conn, llm, profile, cfg))
+
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = config.load()
 
     conn = db.connect(cfg.db_path)
-    db.init_db(conn)
+    prepare_db(conn)
     gemini_client = genai.Client(
         api_key=cfg.gemini_api_key,
         # ms; hung request must not park a to_thread worker forever
@@ -28,25 +65,24 @@ async def main() -> None:
     models = (cfg.gemini_model,)
     if cfg.gemini_fallback_model:
         models += (cfg.gemini_fallback_model,)
+    llm = llm_service.LLM(client=gemini_client, models=models)
+    profile = languages.PROFILES[cfg.bot_lang]
 
     bot = Bot(token=cfg.telegram_token)
-    dp = Dispatcher(storage=MemoryStorage())
-
-    # Inject shared deps into every handler via the data dict.
-    dp["conn"] = conn
-    dp["llm"] = llm_service.LLM(client=gemini_client, models=models)
-    dp["profile"] = languages.PROFILES[cfg.bot_lang]
+    dp = build_dispatcher(conn=conn, llm=llm, profile=profile)
 
     # Access control: ignore anyone not in the allow-list.
     dp.message.filter(F.from_user.id.in_(cfg.allowed_user_ids))
     dp.callback_query.filter(F.from_user.id.in_(cfg.allowed_user_ids))
 
-    dp.include_router(menu.router)
-    dp.include_router(add.router)
-    dp.include_router(training.router)
-
+    daily_task = start_daily_loop(bot, conn, llm, profile, cfg)
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if daily_task is not None:
+            daily_task.cancel()
+            await asyncio.gather(daily_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

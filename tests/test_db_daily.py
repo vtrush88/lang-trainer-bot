@@ -158,6 +158,22 @@ def test_expire_returns_morning_flag_and_only_from_open(conn):
     assert db.expire_task(conn, tid3) is None         # grading не истекает
 
 
+def test_expire_with_include_grading_flips_zombie_grading(conn):
+    cid = _add(conn, "a heads-up")
+    tid = _task(conn, cid, morning=True)
+    db.claim_task(conn, tid)
+    assert db.expire_task(conn, tid) is None                        # контракт по умолчанию
+    assert db.expire_task(conn, tid, include_grading=True) is True  # утро: зомби-grading
+    assert db.get_task(conn, tid)["status"] == "expired"
+    tid2 = _task(conn, cid, morning=False)
+    assert db.expire_task(conn, tid2, include_grading=True) is False   # open тоже истекает
+    assert db.get_task(conn, tid2)["status"] == "expired"
+    tid3 = _task(conn, cid)
+    db.claim_task(conn, tid3); db.finish_task(conn, tid3, ok=True)
+    assert db.expire_task(conn, tid3, include_grading=True) is None    # answered не трогаем
+    assert db.get_task(conn, tid3)["status"] == "answered"
+
+
 def test_set_task_kind(conn):
     cid = _add(conn, "a heads-up")
     tid = _task(conn, cid, kind="listen")

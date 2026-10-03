@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import tempfile
@@ -9,6 +10,8 @@ from aiogram.types import BufferedInputFile, Message
 
 import db
 from services import tts
+
+log = logging.getLogger(__name__)
 
 
 async def send_text_voice(bot, chat_id: int, mp3_path: str, caption: str | None = None,
@@ -44,7 +47,8 @@ async def send_card_voice_to(bot, chat_id: int, conn: sqlite3.Connection, card, 
                                      reply_markup=reply_markup)
         db.set_audio_file_id(conn, card["id"], sent.voice.file_id)
         return sent
-    except (tts.TTSError, OSError, TelegramBadRequest):
+    except (tts.TTSError, OSError, TelegramBadRequest) as exc:
+        log.warning("card voice failed for card %s: %s", card["id"], exc)
         return None
     finally:
         if os.path.exists(tmp):

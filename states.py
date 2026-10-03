@@ -27,3 +27,14 @@ async def leave_modes(state: FSMContext) -> None:
     """
     await state.set_state(None)
     await state.update_data(pending={})
+
+
+async def end_session(state: FSMContext) -> None:
+    """Finish a training session: exactly the former `state.clear()` (state AND all data
+    dropped, incl. `vocab_voice_msg_id`) — except the monotonic `seq` survives, so an
+    old still-visible preview button can never match a preview minted afterwards.
+    """
+    seq = (await state.get_data()).get("seq")
+    await state.clear()
+    if seq is not None:
+        await state.update_data(seq=seq)

@@ -1,5 +1,6 @@
 """Чистая логика ежедневной практики (daily.py)."""
 import random
+import re
 from datetime import date
 
 import pytest
@@ -138,3 +139,132 @@ def test_should_start_loop_needs_both_gates():
     assert daily.should_start_loop(en, off) is False
     assert daily.should_start_loop(es, on) is False   # DAILY_AT в маминой .env — ничего
     assert daily.should_start_loop(es, off) is False
+
+
+# ---- Task 10: рендеры ----
+CARD = {"id": 1, "word": "a heads-up", "translation": "предупреждение заранее",
+        "transcription": "/ˈhedz ʌp/", "example": "Just a heads-up.",
+        "example_translation": "Просто предупреждаю.", "context": "созвон <QA>"}
+S = "Can you give me a heads-up before you merge?"
+S_RU = "Предупредишь меня перед мержем?"
+
+
+def test_card_block_has_no_example_and_escapes():
+    text = daily.card_block(CARD)
+    assert "<b>a heads-up</b>" in text and "предупреждение заранее" in text
+    assert "/ˈhedz ʌp/" in text and "📍 созвон &lt;QA&gt;" in text
+    assert "Just a heads-up." not in text
+    assert "📍" not in daily.card_block({**CARD, "context": None})
+
+
+def test_render_task_compose_hinted_voice_and_text_fallback():
+    t = daily.render_task("compose_hinted", CARD, S, S_RU, "a heads-up", voice_ok=True)
+    assert "Напиши своё предложение с <b>a heads-up</b>" in t and S not in t
+    t2 = daily.render_task("compose_hinted", CARD, S, S_RU, "a heads-up", voice_ok=False)
+    assert daily.VOICE_UNAVAILABLE in t2 and f"<i>{S}</i>" in t2
+    t3 = daily.render_task("compose_hinted", CARD, None, None, None, voice_ok=True)
+    assert daily.VOICE_UNAVAILABLE not in t3 and "Напиши своё предложение" in t3
+    t4 = daily.render_task("compose_hinted", CARD, None, None, None, voice_ok=False)
+    assert daily.VOICE_UNAVAILABLE in t4 and "<i>" not in t4
+
+
+def test_render_task_gap_recall_listen_compose():
+    gap = daily.render_task("gap", CARD, S, S_RU, "a heads-up", voice_ok=False)
+    assert "<i>Can you give me ___ before you merge?</i>" in gap and S_RU in gap
+    recall = daily.render_task("recall", CARD, S, S_RU, "a heads-up", voice_ok=False)
+    assert "«предупреждение заранее»" in recall and "контекст: созвон &lt;QA&gt;" in recall
+    assert S not in recall
+    recall2 = daily.render_task("recall", {**CARD, "context": None}, None, None, None, voice_ok=False)
+    assert "контекст" not in recall2 and "None" not in recall2
+    assert daily.render_task("listen", CARD, S, S_RU, "a heads-up", voice_ok=True) == "Напиши то, что услышишь."
+    assert daily.render_task("compose", CARD, None, None, None, voice_ok=False) == \
+        "Напиши своё предложение с <b>a heads-up</b>."
+
+
+def test_render_compose_result():
+    good = daily.render_compose_result({"verdict": "good", "corrected": "", "note": "ок",
+                                        "reply_sentence": "Thanks for the heads-up!",
+                                        "reply_sentence_ru": "Спасибо!"})
+    assert good.startswith("✅ Отлично, звучит естественно.")
+    assert "Моё в ответ: <i>Thanks for the heads-up!</i>" in good
+    fix = daily.render_compose_result({"verdict": "fix", "corrected": "I gave the team a heads-up.",
+                                       "note": "нужен артикль", "reply_sentence": None,
+                                       "reply_sentence_ru": None})
+    assert fix == "✅ Почти. Лучше так: I gave the team a heads-up. (нужен артикль)"
+    off = daily.render_compose_result({"verdict": "off", "corrected": "", "note": "фраза не использована",
+                                       "reply_sentence": None, "reply_sentence_ru": None})
+    assert off == "❌ Фраза тут не сработала: фраза не использована."
+    assert "лимит" in daily.render_compose_result(None)
+
+
+def test_render_grade_result():
+    assert daily.render_grade_result(None, exact=True, expected="a heads-up", quota=False) == "✅ Верно!"
+    typo = daily.render_grade_result({"verdict": "typo", "correct": "a heads-up", "note": "дефис"},
+                                     exact=False, expected="a heads-up", quota=False)
+    assert typo == "✅ Почти! Правильно: a heads-up (дефис)"
+    wrong = daily.render_grade_result({"verdict": "wrong", "correct": "a heads-up", "note": "это другое"},
+                                      exact=False, expected="a heads-up", quota=False)
+    assert wrong == "❌ Не совсем. Правильно: a heads-up (это другое)"
+    quota = daily.render_grade_result(None, exact=False, expected="a heads-up", quota=True)
+    assert quota.startswith("❌ Правильно: a heads-up") and "лимит" in quota
+
+
+def test_render_listen_and_giveup_and_with_sentence():
+    assert daily.render_listen_result(True, S) == f"✅ Всё верно: <i>{S}</i>"
+    assert daily.render_listen_result(False, S) == f"Почти. Было: <i>{S}</i>"
+    g = daily.render_giveup(CARD, S)
+    assert g.startswith("Ничего 🙂") and "<b>a heads-up</b>" in g and f"<i>{S}</i>" in g
+    assert "📝 пример: Just a heads-up." in g
+    assert g.endswith("Вернусь с ней завтра.")
+    assert "<i>" not in daily.render_giveup(CARD, None)
+    assert daily.with_sentence("x", S) == f"x\n\n🔊 <i>{S}</i>"
+    assert daily.with_sentence("x", None) == "x"
+
+
+def test_texts_are_gender_neutral_and_nothing_found():
+    assert daily.TEXT_NOTHING_FOUND.startswith("Не вижу, что тут взять")
+    for name in dir(daily):
+        if name.startswith("TEXT_"):
+            val = getattr(daily, name)
+            assert "написала" not in val and "умница" not in val and "Не нашёл" not in val
+
+
+def test_render_escapes_user_and_model_text():
+    assert "&lt;b&gt;" in daily.render_listen_result(False, "<b>x</b>")
+    fix = daily.render_compose_result({"verdict": "fix", "corrected": "a<b", "note": "&",
+                                       "reply_sentence": "<i>", "reply_sentence_ru": None})
+    assert "a&lt;b" in fix and "(&amp;)" in fix and "<i>&lt;i&gt;</i>" in fix
+
+
+def test_fit_caption_guarantees_limit_without_broken_html():
+    short = "<b>ok</b>"
+    assert daily.fit_caption(short) == short
+    long = "<b>" + "a" * 600 + "</b> &amp; <i>" + "b" * 600 + "</i>"
+    out = daily.fit_caption(long)
+    assert len(out) <= daily.CAPTION_LIMIT and out.endswith("…")
+    assert "<" not in out and "&amp;" in out
+    assert len(daily.fit_caption("&" * 1030)) <= daily.CAPTION_LIMIT
+
+
+def test_fit_caption_two_unclosed_tags_and_entity_at_cut():
+    out = daily.fit_caption("<b><i>" + "a" * 1100)           # два незакрытых тега
+    assert "<" not in out and len(out) <= daily.CAPTION_LIMIT
+    # сущность у границы реза: в plain это «&», заново экранируется целиком
+    for pad in range(1010, 1030):
+        text = "x" * pad + "&amp;" * 10
+        res = daily.fit_caption(text)
+        assert len(res) <= daily.CAPTION_LIMIT
+        body = res[:-1]
+        assert not re.search(r"&(?!amp;|lt;|gt;)", body)     # нет разорванных сущностей
+        assert not re.search(r"&[a-z]*$", body.replace("&amp;", ""))
+
+
+def test_fit_caption_long_text_length_bound():
+    assert len(daily.fit_caption("<b>" + "я<&>" * 2000 + "</b>")) <= daily.CAPTION_LIMIT
+
+
+def test_fit_caption_escape_heavy_keeps_content():
+    for text in ("&amp;" * 300 + "x" * 800, "<b>" + "&lt;" * 700 + "</b>"):
+        out = daily.fit_caption(text)
+        assert 500 < len(out) <= daily.CAPTION_LIMIT and out.endswith("…")
+        assert not re.search(r"&(?!amp;|lt;|gt;)", out[:-1])

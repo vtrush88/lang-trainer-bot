@@ -18,7 +18,7 @@ import voice
 from languages import LanguageProfile
 from services import grading, srs
 from services.llm import LLM, QuotaExceededError
-from states import Training, leave_modes
+from states import Training, end_session, leave_modes
 
 router = Router()
 EMPTY = ("На сегодня всё повторили! 🎉 Можешь добавить новые слова "
@@ -38,7 +38,7 @@ async def _show_next_flashcard(
             queue = queue[1:]
     await state.update_data(queue=queue)
     if not queue:
-        await state.clear()
+        await end_session(state)
         await message.answer("Все слова повторены — ты молодец! ❤️", reply_markup=keyboards.main_menu())
         return
     await message.answer(f"🎴 {card['word']}")
@@ -116,7 +116,7 @@ async def _ask_next_translation(
             queue = queue[1:]
     await state.update_data(queue=queue)
     if not queue:
-        await state.clear()
+        await end_session(state)
         await message.answer("Все слова повторены — ты молодец! ❤️",
                              reply_markup=keyboards.main_menu())
         return
@@ -229,7 +229,7 @@ async def _ask_next_listen(
             queue = queue[1:]
     await state.update_data(queue=queue)
     if not queue:
-        await state.clear()
+        await end_session(state)
         await message.answer("Все слова повторены — ты молодец! ❤️",
                              reply_markup=keyboards.main_menu())
         return
