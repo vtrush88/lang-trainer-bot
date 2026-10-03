@@ -172,3 +172,70 @@ def test_release_stale_grading_on_startup(conn):
     assert db.release_stale_grading(conn) == 1
     assert db.get_task(conn, tid)["status"] == "open"
     assert db.release_stale_grading(conn) == 0
+
+
+def test_pick_due_card_prefers_new_then_most_overdue(conn):
+    today = date(2026, 10, 5)
+    old = _add(conn, "old phrase", today=date(2026, 9, 1))
+    db.update_review(conn, old, interval_days=3, due_at=date(2026, 9, 4), remembered=True)
+    older = _add(conn, "older phrase", today=date(2026, 8, 1))
+    db.update_review(conn, older, interval_days=7, due_at=date(2026, 8, 8), remembered=True)
+    new = _add(conn, "new phrase", today=date(2026, 10, 4))
+    assert db.pick_due_card(conn, U, today)["id"] == new           # новая первой
+    db.update_review(conn, new, interval_days=1, due_at=date(2026, 10, 6), remembered=True)
+    assert db.pick_due_card(conn, U, today)["id"] == older         # самая просроченная
+
+
+def test_pick_due_card_skips_today_created_unenriched_and_untranslated(conn):
+    today = date(2026, 10, 5)
+    _add(conn, "created today", today=today)                       # created_at == today
+    _add(conn, "not enriched", today=date(2026, 10, 1), enriched=False)
+    _add(conn, "no translation", today=date(2026, 10, 1), translation=None)
+    _add(conn, "empty translation", today=date(2026, 10, 1), translation="")
+    assert db.pick_due_card(conn, U, today) is None
+    ok = _add(conn, "fine", today=date(2026, 10, 4))
+    assert db.pick_due_card(conn, U, today)["id"] == ok
+    assert db.pick_due_card(conn, 999, today) is None
+
+
+def test_pick_due_card_respects_due_at(conn):
+    today = date(2026, 10, 5)
+    cid = _add(conn, "fine", today=date(2026, 10, 1))
+    db.update_review(conn, cid, interval_days=30, due_at=date(2026, 11, 1), remembered=True)
+    assert db.pick_due_card(conn, U, today) is None
+
+
+def test_recent_sentences_includes_replies_excludes_examples(conn):
+    cid = _add(conn, "a heads-up")
+    t1 = _task(conn, cid, sentence="S1", sentence_ru="r", morning=False)
+    db.claim_task(conn, t1); db.finish_task(conn, t1, ok=True, reply_sentence="R1")
+    t2 = _task(conn, cid, sentence="EX", sentence_ru="r", from_example=True, morning=False)
+    db.claim_task(conn, t2); db.finish_task(conn, t2, ok=True, reply_sentence="R2")
+    t3 = _task(conn, cid, sentence="S3", sentence_ru="r", morning=False)
+    db.claim_task(conn, t3); db.finish_task(conn, t3, ok=False, reply_sentence="S1")
+    assert db.recent_sentences(conn, cid) == ["S3", "S1", "R2", "R1"]   # EX исключён, R2 — нет
+    assert db.recent_sentences(conn, cid, n=2) == ["S3", "S1"]
+    assert db.recent_sentences(conn, 12345) == []
+
+
+def test_count_tasks_on(conn):
+    cid = _add(conn, "a heads-up")
+    t = _task(conn, cid, today=date(2026, 10, 5)); db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    t = _task(conn, cid, today=date(2026, 10, 5), morning=False); db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    _task(conn, cid, today=date(2026, 10, 4))
+    assert db.count_tasks_on(conn, U, date(2026, 10, 5)) == 2
+    assert db.count_tasks_on(conn, U, date(2026, 10, 6)) == 0
+
+
+def test_daily_state_counters(conn):
+    st = db.get_daily_state(conn, U)
+    assert st["missed_streak"] == 0 and st["last_sent_on"] is None
+    db.bump_missed(conn, U); db.bump_missed(conn, U)
+    assert db.get_daily_state(conn, U)["missed_streak"] == 2
+    db.set_last_sent(conn, U, date(2026, 10, 5))
+    assert db.get_daily_state(conn, U)["last_sent_on"] == "2026-10-05"
+    db.reset_missed(conn, U)
+    st = db.get_daily_state(conn, U)
+    assert st["missed_streak"] == 0 and st["last_sent_on"] == "2026-10-05"
+    db.reset_missed(conn, 777)  # на несуществующем — не падает
+    assert db.get_daily_state(conn, 777)["missed_streak"] == 0

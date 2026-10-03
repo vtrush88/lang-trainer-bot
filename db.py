@@ -316,3 +316,72 @@ def release_stale_grading(conn: sqlite3.Connection) -> int:
                        (TASK_OPEN, TASK_GRADING))
     conn.commit()
     return cur.rowcount
+
+
+def pick_due_card(conn: sqlite3.Connection, user_id: int, today: date) -> sqlite3.Row | None:
+    """Карточка для задания: новые первыми (тёплый контекст), потом самая просроченная.
+
+    Только обогащённые с переводом и созданные ДО сегодня («придёт завтра утром»).
+    """
+    iso = today.isoformat()
+    return conn.execute(
+        """
+        SELECT * FROM cards
+        WHERE user_id = ? AND due_at <= ? AND enriched = 1
+          AND translation IS NOT NULL AND translation != ''
+          AND created_at < ?
+        ORDER BY (interval_days = 0) DESC, due_at, id
+        LIMIT 1
+        """,
+        (user_id, iso, iso),
+    ).fetchone()
+
+
+def recent_sentences(conn: sqlite3.Connection, card_id: int, n: int = 6) -> list[str]:
+    rows = conn.execute(
+        "SELECT CASE WHEN from_example = 0 THEN sentence END AS sentence, reply_sentence"
+        " FROM daily_tasks WHERE card_id = ? ORDER BY id DESC",
+        (card_id,),
+    ).fetchall()
+    out: list[str] = []
+    for row in rows:
+        for s in (row["sentence"], row["reply_sentence"]):
+            if s and s not in out:
+                out.append(s)
+            if len(out) >= n:
+                return out
+    return out
+
+
+def count_tasks_on(conn: sqlite3.Connection, user_id: int, today: date) -> int:
+    cur = conn.execute(
+        "SELECT COUNT(*) AS n FROM daily_tasks WHERE user_id = ? AND sent_on = ?",
+        (user_id, today.isoformat()))
+    return int(cur.fetchone()["n"])
+
+
+def get_daily_state(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row:
+    conn.execute("INSERT OR IGNORE INTO daily_state (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    return conn.execute("SELECT * FROM daily_state WHERE user_id = ?",
+                        (user_id,)).fetchone()
+
+
+def bump_missed(conn: sqlite3.Connection, user_id: int) -> None:
+    get_daily_state(conn, user_id)
+    conn.execute("UPDATE daily_state SET missed_streak = missed_streak + 1 WHERE user_id = ?",
+                 (user_id,))
+    conn.commit()
+
+
+def reset_missed(conn: sqlite3.Connection, user_id: int) -> None:
+    get_daily_state(conn, user_id)
+    conn.execute("UPDATE daily_state SET missed_streak = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+
+def set_last_sent(conn: sqlite3.Connection, user_id: int, today: date) -> None:
+    get_daily_state(conn, user_id)
+    conn.execute("UPDATE daily_state SET last_sent_on = ? WHERE user_id = ?",
+                 (today.isoformat(), user_id))
+    conn.commit()
