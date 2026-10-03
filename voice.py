@@ -11,26 +11,37 @@ import db
 from services import tts
 
 
-async def send_card_voice(
-    message: Message, conn: sqlite3.Connection, card, voice: str
-) -> Message | None:
-    """Send cached audio by file_id, else synthesize and cache the file_id.
+async def send_text_voice(bot, chat_id: int, mp3_path: str, caption: str | None = None,
+                          parse_mode: str | None = None, reply_markup=None) -> Message:
+    """Отправить ГОТОВЫЙ mp3 голосовым (sendVoice принимает MP3 с Bot API 7.2).
 
-    Sent as a voice message (Bot API ≥7.2 accepts MP3 in sendVoice): voice
-    bubbles don't join the chat-wide music playlist, so playing one word
-    never auto-plays the others. Cached file_ids are voice-type.
-    Best-effort: on failure the text card is already shown, so we stay
-    silent and return None. Returns the sent voice Message otherwise.
+    Без кэша и без синтеза: каждое предложение новое, синтез делает вызывающий,
+    он же удаляет файл. Ошибки Telegram пробрасываются — решение о деградации
+    принимает вызывающий.
     """
-    if card["audio_file_id"]:
-        return await message.answer_voice(card["audio_file_id"])
+    with open(mp3_path, "rb") as fh:
+        return await bot.send_voice(
+            chat_id, BufferedInputFile(fh.read(), filename="произношение.mp3"),
+            caption=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+async def send_card_voice_to(bot, chat_id: int, conn: sqlite3.Connection, card, voice: str,
+                             caption: str | None = None, parse_mode: str | None = None,
+                             reply_markup=None) -> Message | None:
+    """Озвучка слова карточки: кэш по file_id, иначе синтез + кэширование.
+
+    Голосовое, не audio: voice-пузыри не склеиваются клиентом в плейлист.
+    file_id привязан к типу сообщения — при смене voice↔audio кэш сбрасывать.
+    Best-effort: при сбое возвращает None (текст уже показан).
+    """
     tmp = os.path.join(tempfile.gettempdir(), f"tts_{os.getpid()}_{card['id']}.mp3")
     try:
+        if card["audio_file_id"]:
+            return await bot.send_voice(chat_id, card["audio_file_id"], caption=caption,
+                                        parse_mode=parse_mode, reply_markup=reply_markup)
         await tts.synthesize(card["word"], voice, tmp)
-        with open(tmp, "rb") as fh:
-            sent = await message.answer_voice(
-                BufferedInputFile(fh.read(), filename="произношение.mp3")
-            )
+        sent = await send_text_voice(bot, chat_id, tmp, caption=caption, parse_mode=parse_mode,
+                                     reply_markup=reply_markup)
         db.set_audio_file_id(conn, card["id"], sent.voice.file_id)
         return sent
     except (tts.TTSError, OSError, TelegramBadRequest):
@@ -38,3 +49,12 @@ async def send_card_voice(
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+async def send_card_voice(message: Message, conn: sqlite3.Connection, card, voice: str,
+                          caption: str | None = None, parse_mode: str | None = None,
+                          reply_markup=None) -> Message | None:
+    """Прежняя сигнатура (menu/training/add) + необязательные подпись/клавиатура."""
+    return await send_card_voice_to(message.bot, message.chat.id, conn, card, voice,
+                                    caption=caption, parse_mode=parse_mode,
+                                    reply_markup=reply_markup)
