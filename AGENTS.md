@@ -30,29 +30,36 @@ Victoria для теста); данные ключуются по `user_id`.
 
 Python 3.12 · **aiogram 3.13.1** (long-polling, MemoryStorage FSM) · **SQLite** (stdlib) ·
 **google-genai 2.8.0** (`gemini-3.5-flash`, фолбэк `gemini-3.5-flash-lite` — бесплатный тир) · **edge-tts 7.2.8** (`es-ES-XimenaNeural`) ·
-python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **354 теста.**
+python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **371 тест.**
 
 ## Структура
 
 ```
 bot.py            точка входа: prepare_db, build_dispatcher(...) (access-filter ALLOWED_USER_IDS,
-                  внедряет conn+llm+profile, роутеры; daily-роутер последним и только при
-                  profile.daily_practice), start_daily_loop, polling
+                  внедряет conn+llm+profile, роутеры; commands-роутер ПЕРВЫМ и только при
+                  profile.command_menu, daily-роутер последним и только при
+                  profile.daily_practice), setup_commands (set_my_commands только en),
+                  start_daily_loop, polling
 config.py         env: TELEGRAM_TOKEN, GEMINI_API_KEY, GEMINI_MODEL, GEMINI_FALLBACK_MODEL, ALLOWED_USER_IDS, DB_PATH, BOT_LANG,
                   DAILY_AT, DAILY_TZ (дефолт Europe/Madrid), DAILY_EXCLUDE_IDS, MORNING_HOURS (05–13)
 db.py             SQLite: cards (15 полей + context), CRUD, get_due_cards, card_exists (дедуп);
                   + daily_tasks/daily_state (жизненный цикл задания, запросы)
 languages.py     языковые профили: голос, промпты, схемы Gemini, UI-строки; выбор через BOT_LANG;
                   + флаг daily_practice и три промпта EN (es байт-в-байт без изменений)
+                  + флаг command_menu (en: без reply-клавиатуры, команды «/»)
 daily.py          ежедневная практика (en): чистая логика + тексты, send_daily_task / answer_task /
                   daily_loop / capture_items (IO, per-user локи)
 handlers/daily.py тонкий роутер: /next, more:, take:, clarify:, свободный текст, не-текст
+handlers/commands.py команды «/» en-бота (/next /add /vocab /cards /check /listen) — без
+                     StateFilter, делегируют в add/menu/training/daily; bot_commands() для меню «/»
 services/sentences.py  Gemini: предложение для задания + check_sentence (проверка ответа)
 services/capture.py    Gemini: извлечение фраз из пересланного текста с контекстом
-handlers/menu.py     /start, главное меню, «Мой словарь» (5/стр, тап по номеру →
+handlers/menu.py     /start (нижнее меню — keyboards.menu_markup(profile): es — reply-клавиатура,
+                     en — ReplyKeyboardRemove), «Мой словарь» (5/стр, тап по номеру →
                      карточка с аудио и удалением; страница ездит в callback'ах)
 handlers/add.py      добавление (залипающий режим): enrich → дедуп → превью+аудио
-                     → сохранить да/нет; остаёшься в режиме, выход — кнопкой меню
+                     → сохранить да/нет; остаёшься в режиме, выход — es: кнопкой меню,
+                     en: любой командой «/»
 handlers/training.py 3 режима: карточки / проверка перевода / аудирование
 voice.py          общий send_card_voice: голосовое из кэша file_id или edge-tts;
                   send_text_voice, send_card_voice_to (+ caption/parse_mode/reply_markup)
@@ -82,7 +89,7 @@ cp .env.example .env        # заполнить: TELEGRAM_TOKEN (@BotFather),
                             # GEMINI_API_KEY (Google AI Studio, бесплатно), ALLOWED_USER_IDS (свой tg id)
 python bot.py               # long-polling
 ```
-Тесты: `.venv/bin/pytest -q` (ожидается 354 passed).
+Тесты: `.venv/bin/pytest -q` (ожидается 371 passed).
 Секреты (`.env`), БД (`spanish_bot.db`), `.venv` — в `.gitignore`, не коммитить.
 
 **Деплой на сервер:** пошаговый ран-бук — `docs/superpowers/deploy.md`
@@ -173,8 +180,8 @@ python bot.py               # long-polling
 ## Статус и бэклог
 
 **Готово:** MVP собран (subagent-driven, TDD + ревью), протестирован вживую в Telegram
-(@SimpleSpanishBot), слит в `main` + вторая волна доработок 2026-06-10. 354 теста зелёных
-(124 до ежедневной практики).
+(@SimpleSpanishBot), слит в `main` + вторая волна доработок 2026-06-10. 371 тест зелёный
+(124 до ежедневной практики, 354 после неё, +17 — меню команд en-бота).
 **Задеплоен на VPS (2026-06-15):** DigitalOcean Frankfurt, systemd (`Restart=always`),
 ночной бэкап через `scripts/backup-db.sh`, приватный GitHub-репо `vtrush88/lang-trainer-bot`
 (до 2026-08-04 — `spanish-bot`, переименован после появления второго бота).
@@ -212,10 +219,15 @@ python bot.py               # long-polling
 - Вне MVP (в спеке, для es): пуш-напоминания, статистика прогресса. (У en-бота утренняя
   выдача есть — ежедневная практика ниже.)
 
-**Ежедневная практика «своё слово в день» (en-бот) — реализовано, не задеплоено (2026-10-03):**
-построена на ветке `daily-practice` (subagent-driven по плану, 14 задач + финальная волна фиксов, 354 теста); часть
-изменений ещё не закоммичена, в `main` не слита, на VPS не выкачена — деплой отдельным решением
-Victoria (процедура — `docs/superpowers/deploy.md`, «Ежедневная практика (en-бот)»).
+**Ежедневная практика «своё слово в день» (en-бот) — LIVE с 2026-10-03:** построена на ветке
+`daily-practice` (subagent-driven по плану, 14 задач + финальная волна фиксов, 354 теста), слита в `main`
+(fast-forward, `19dd76b`) и выкачена на VPS в тот же день: в `.env` юнита `english-bot` добавлены
+`DAILY_AT=09:30`, `DAILY_TZ=Europe/Madrid`; первый запуск цикла в журнале: `daily loop: next fire
+2026-10-04 09:30:00+02:00`. Мамин юнит не трогали (его код обновится при следующем его деплое, для es
+изменения чисто аддитивные). Процедура — `docs/superpowers/deploy.md`, «Ежедневная практика (en-бот)».
+⚠️ Замечено при деплое: `english-bot` с 2026-10-01 примерно раз в сутки убивается SIGKILL (5 раз к
+2026-10-03, systemd поднимает) — похоже на OOM на 1 ГБ без swap (free ≈ 70 МБ); к фиче не относится,
+но убийство в момент утреннего задания его сорвёт — нужен swap или апгрейд дроплета.
 Интент `docs/superpowers/intent/daily-practice.md`, спека
 `docs/superpowers/specs/2026-09-30-daily-practice-design.md` (дельты реализации — в её «Провенансе»),
 план `docs/superpowers/plans/2026-10-02-daily-practice.md`.
@@ -227,3 +239,13 @@ es-бот не меняется. Решения брейншторма («не �
 Хвосты (после деплоя / на финальном ревью ветки):
 - `daily.py` ~590 строк смешивает чистую логику и IO — кандидат на разделение.
 - Текст отказа `/next` переиспользует формулировку отказа сбора фраз.
+
+**En-бот без reply-клавиатуры, меню через «/» (2026-10-03, в рабочей копии, не задеплоено):**
+решение Victoria — у @EnglishUpgradeBot пять кнопок убраны совсем, разделы — командами Telegram
+`/next /add /vocab /cards /check /listen` (`handlers/commands.py`, список в клиенте выставляет
+`bot.setup_commands` → `set_my_commands` на старте). Флаг профиля `command_menu` (у es дефолт `False`):
+`keyboards.menu_markup(profile)` шлёт `ReplyKeyboardRemove` вместо клавиатуры в `/start` и в концах
+тренировок; EN-тексты `greeting`/`add_intro`/пустой словарь говорят о командах. Роутер команд
+подключается ПЕРВЫМ — иначе `/vocab` в режиме добавления ушёл бы в Gemini как слово. Мамин
+@SimpleSpanishBot не меняется: тексты, клавиатура, роутеры те же, `set_my_commands` для es не
+вызывается вовсе. Деплой — `docs/superpowers/deploy.md`, «Ежедневная практика (en-бот)».
