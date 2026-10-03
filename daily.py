@@ -7,7 +7,7 @@ from __future__ import annotations
 import difflib
 import random
 import re
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import intents
 from services import srs
@@ -99,3 +99,23 @@ def classify_incoming(text: str, *, forwarded: bool, has_open_task: bool) -> str
 def strip_capture_prefix(text: str) -> str:
     t = text.strip()
     return t[1:].strip() if t.startswith("+") else t
+
+
+def next_fire(now: datetime, hour: int, minute: int) -> datetime:
+    """Ближайший hour:minute в зоне now — сегодня или завтра, свежим aware datetime."""
+    tz = now.tzinfo
+    target = datetime(now.year, now.month, now.day, hour, minute, tzinfo=tz)
+    if target <= now:
+        d = now.date() + timedelta(days=1)
+        target = datetime(d.year, d.month, d.day, hour, minute, tzinfo=tz)
+    return target
+
+
+def fire_delay(now: datetime, target: datetime) -> float:
+    """Секунды до target в АБСОЛЮТНОМ времени (вычитание aware-дат идёт по стенке, DST-грабля)."""
+    return max(0.0, target.timestamp() - now.timestamp())
+
+
+def should_start_loop(profile, cfg) -> bool:
+    """Оба гейта: профиль с daily_practice И DAILY_AT в .env."""
+    return bool(getattr(profile, "daily_practice", False)) and cfg.daily_at is not None

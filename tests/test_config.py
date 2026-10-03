@@ -120,3 +120,68 @@ def test_bot_lang_empty_string_falls_back_to_es(monkeypatch):
     monkeypatch.setenv("BOT_LANG", "")
     cfg = config.load()
     assert cfg.bot_lang == "es"
+
+
+import logging
+from datetime import time
+
+
+def _base_env(monkeypatch):
+    monkeypatch.setattr(config, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("TELEGRAM_TOKEN", "t")
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("ALLOWED_USER_IDS", "1")
+    for var in ("DAILY_AT", "DAILY_TZ", "DAILY_EXCLUDE_IDS"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_daily_off_by_default_and_other_vars_not_validated(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("DAILY_TZ", "Mars/Olympus")   # мусор не должен мешать выключенной фиче
+    cfg = config.load()
+    assert cfg.daily_at is None
+    assert cfg.daily_exclude_ids == set()
+
+
+def test_daily_at_parsed_with_defaults(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("DAILY_AT", "09:30")
+    cfg = config.load()
+    assert cfg.daily_at == time(9, 30)
+    assert cfg.daily_tz == "Europe/Madrid"
+    assert cfg.daily_exclude_ids == set()
+
+
+def test_daily_exclude_ids_parsed(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("DAILY_AT", "09:30")
+    monkeypatch.setenv("DAILY_EXCLUDE_IDS", "5, 6")
+    assert config.load().daily_exclude_ids == {5, 6}
+
+
+@pytest.mark.parametrize("raw", ["9h", "25:00", "09:60", "", "nine", "9:30", "09:3"])
+def test_malformed_daily_at_fails_fast(monkeypatch, raw):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("DAILY_AT", raw)
+    if raw == "":
+        assert config.load().daily_at is None   # пустая строка = выключено
+        return
+    with pytest.raises(ValueError, match="DAILY_AT"):
+        config.load()
+
+
+def test_bad_daily_tz_fails_fast_when_enabled(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("DAILY_AT", "09:30")
+    monkeypatch.setenv("DAILY_TZ", "Mars/Olympus")
+    with pytest.raises(Exception):   # ZoneInfoNotFoundError
+        config.load()
+
+
+def test_evening_daily_at_warns_but_loads(monkeypatch, caplog):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("DAILY_AT", "20:00")
+    with caplog.at_level(logging.WARNING, logger="config"):
+        cfg = config.load()
+    assert cfg.daily_at == time(20, 0)
+    assert any("DAILY_AT" in r.message for r in caplog.records)

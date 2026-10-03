@@ -96,3 +96,45 @@ def test_strip_capture_prefix():
     assert daily.strip_capture_prefix("+heads-up") == "heads-up"
     assert daily.strip_capture_prefix("heads-up") == "heads-up"
     assert daily.strip_capture_prefix("+") == ""
+
+
+from datetime import datetime, time
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+MADRID = ZoneInfo("Europe/Madrid")
+
+
+def test_next_fire_today_if_still_ahead():
+    now = datetime(2026, 10, 5, 8, 0, tzinfo=MADRID)
+    assert daily.next_fire(now, 9, 30) == datetime(2026, 10, 5, 9, 30, tzinfo=MADRID)
+
+
+def test_next_fire_tomorrow_if_passed():
+    now = datetime(2026, 10, 5, 9, 30, tzinfo=MADRID)
+    assert daily.next_fire(now, 9, 30) == datetime(2026, 10, 6, 9, 30, tzinfo=MADRID)
+
+
+def test_fire_delay_is_absolute_across_dst():
+    # 2026-03-29 02:00 → 03:00 в Мадриде: до 09:00 следующего дня реально 23 часа
+    now = datetime(2026, 3, 28, 9, 0, tzinfo=MADRID)
+    target = daily.next_fire(now, 9, 0)
+    assert target == datetime(2026, 3, 29, 9, 0, tzinfo=MADRID)
+    assert daily.fire_delay(now, target) == 23 * 3600
+    assert (target - now).total_seconds() == 24 * 3600  # вот почему не так
+
+
+def test_fire_delay_never_negative():
+    now = datetime(2026, 10, 5, 9, 0, tzinfo=MADRID)
+    assert daily.fire_delay(now, now) == 0.0
+
+
+def test_should_start_loop_needs_both_gates():
+    en = SimpleNamespace(daily_practice=True)
+    es = SimpleNamespace(daily_practice=False)
+    on = SimpleNamespace(daily_at=time(9, 30))
+    off = SimpleNamespace(daily_at=None)
+    assert daily.should_start_loop(en, on) is True
+    assert daily.should_start_loop(en, off) is False
+    assert daily.should_start_loop(es, on) is False   # DAILY_AT в маминой .env — ничего
+    assert daily.should_start_loop(es, off) is False
