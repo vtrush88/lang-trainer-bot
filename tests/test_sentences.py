@@ -176,3 +176,14 @@ def test_check_sentence_requires_note():
     out = sentences.check_sentence(_llm(client), EN, CARD, "x", [])
     assert out["note"] == "нужен артикль"
     assert client.models.generate_content.call_count == 2
+
+
+def test_check_sentence_reply_regeneration_gets_learner_sentence_as_context():
+    bad_reply = {**CHECK, "reply_phrase_form": "not there"}
+    client = MagicMock()
+    client.models.generate_content.side_effect = [_resp(bad_reply), _resp(GOOD)]
+    sentences.check_sentence(_llm(client), EN, CARD, "I made this bot to pursue my goal.", [])
+    second = client.models.generate_content.call_args_list[1].kwargs["contents"]
+    assert "I made this bot to pursue my goal." in str(second)
+    assert "ответ собеседнику" in str(second)
+    assert CARD["context"] in str(second)

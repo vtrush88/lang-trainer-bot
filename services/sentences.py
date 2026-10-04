@@ -91,7 +91,11 @@ def check_sentence(llm: llm_service.LLM, profile: LanguageProfile, card, answer:
         return result
     # Вердикт зафиксирован; ответное предложение добираем отдельно, check не повторяем.
     try:
-        fresh = make_sentence(llm, profile, card, "reply", [*avoid, answer])
+        topic = _topic(card).strip()
+        reply_ctx = f"ответ собеседнику на реплику: «{answer}»"
+        reply_card = {**dict(card),
+                      "context": f"{topic}; {reply_ctx}" if topic else reply_ctx}
+        fresh = make_sentence(llm, profile, reply_card, "reply", [*avoid, answer])
         result["reply_sentence"], result["reply_sentence_ru"] = fresh["sentence"], fresh["sentence_ru"]
     except Exception as exc:   # noqa: BLE001 — вердикт уже есть, ответное предложение — best-effort
         log.warning("reply sentence regeneration failed: %s", exc)

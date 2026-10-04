@@ -217,3 +217,9 @@ def test_en_texts_point_to_commands_not_buttons():
     assert "➕ Добавить слово" not in en.greeting and "📖 Мой словарь" not in en.greeting
     assert "меню внизу" not in en.add_intro
     assert "/" in en.add_intro
+
+
+def test_en_sentence_check_prompt_asks_reply_to_learner_sentence():
+    en = PROFILES["en"]
+    assert "ответная реплика собеседника" in en.sentence_check_system
+    assert "what else are you planning" in en.sentence_check_system

@@ -42,7 +42,7 @@ async def test_compose_good_updates_srs_and_sends_reply_voice(conn, fake_tts, mo
     assert card["interval_days"] == 1 and card["due_at"] == "2026-10-06" and card["reps"] == 1
     assert len(bot.sent) == 1 and bot.sent[0][0] == "voice"
     assert "✅ Отлично" in bot.sent[0][2] and "Thanks for the heads-up!" in bot.sent[0][2]
-    assert f"<i>{S}</i>" in bot.sent[0][2]      # (о): подсказку, которую слышала, видно текстом
+    assert f"<i>{S}</i>" not in bot.sent[0][2]   # (с): текст подсказки не показываем (отмена (о))
     assert db.get_daily_state(conn, U)["missed_streak"] == 0
 
 
@@ -330,14 +330,14 @@ async def test_gap_full_sentence_typed_is_correct_without_gemini(conn, fake_tts,
     assert db.get_card(conn, cid)["interval_days"] == 3 and db.get_card(conn, cid)["lapses"] == 0
 
 
-async def test_compose_hinted_quota_result_also_shows_hint_sentence(conn, fake_tts, monkeypatch):
+async def test_compose_hinted_quota_result_has_no_hint_sentence(conn, fake_tts, monkeypatch):
     def boom(*a, **k):
         raise QuotaExceededError("q")
     monkeypatch.setattr(sentences, "check_sentence", boom)
     _open(conn, _card(conn), "compose_hinted")
     bot = FakeBot()
     await daily.answer_task(bot, conn, None, EN, U, "I gave a heads-up.", TODAY, giveup=False)
-    assert "лимит" in bot.sent[0][2] and f"<i>{S}</i>" in bot.sent[0][2]
+    assert "лимит" in bot.sent[0][2] and f"<i>{S}</i>" not in bot.sent[0][2]
 
 
 async def test_compose_without_sentence_result_has_no_hint_block(conn, fake_tts, monkeypatch):

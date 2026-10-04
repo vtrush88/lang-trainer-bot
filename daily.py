@@ -511,13 +511,11 @@ async def grade_answer(llm, profile, task, card, answer: str, *, giveup: bool,
                                             answer, avoid)
         except QuotaExceededError:
             check = None
-        # compose_hinted: предложение-подсказку слышала — после ответа видно и текстом
-        hint = sentence if kind == "compose_hinted" else None
         if check is None:
-            return Graded(True, with_sentence(render_compose_result(None), hint), None, None)
+            return Graded(True, render_compose_result(None), None, None)
         reply = check.get("reply_sentence")
         return Graded(check["verdict"] in ("good", "fix"),
-                      with_sentence(render_compose_result(check), hint), reply, reply)
+                      render_compose_result(check), reply, reply)
     if kind in ("recall", "gap"):
         expected = card["word"] if kind == "recall" else (task["phrase_form"] or card["word"])
         prompt_ru = (card["translation"] if kind == "recall"
