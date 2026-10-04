@@ -289,7 +289,7 @@ async def test_recall_quota_shows_expected_and_counts_wrong(conn, fake_tts, monk
 async def test_compose_avoid_comes_from_recent_sentences(conn, fake_tts, monkeypatch):
     seen = {}
 
-    def spy(llm, profile, card, answer, avoid):
+    def spy(llm, profile, card, answer, avoid, hint=None):
         seen["avoid"] = avoid
         return {**CHECK, "reply_sentence": None}
     monkeypatch.setattr(sentences, "check_sentence", spy)
@@ -346,3 +346,54 @@ async def test_compose_without_sentence_result_has_no_hint_block(conn, fake_tts,
     bot = FakeBot()
     await daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False)
     assert bot.sent[0][2] == "✅ Отлично, звучит естественно."
+
+
+# ---- (т) ответ, скопированный с подсказки, не засчитывается ----
+
+async def _copy_case(conn, fake_tts, monkeypatch, kind, answer):
+    monkeypatch.setattr(sentences, "check_sentence", lambda *a, **k: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, kind)
+    db.bump_missed(conn, U)
+    before = dict(db.get_card(conn, cid))
+    bot = FakeBot()
+    result = await daily.answer_task(bot, conn, None, EN, U, answer, TODAY, giveup=False)
+    return cid, tid, before, bot, result
+
+
+@pytest.mark.parametrize("answer", [S, "can you give me a HEADS-UP before you merge", "  " + S.upper() + "! "])
+async def test_compose_hinted_copy_of_hint_is_retry(conn, fake_tts, monkeypatch, answer):
+    cid, tid, before, bot, result = await _copy_case(conn, fake_tts, monkeypatch, "compose_hinted", answer)
+    assert result == "retry"
+    assert db.get_task(conn, tid)["status"] == "open"
+    assert dict(db.get_card(conn, cid)) == before
+    assert [m[2] for m in bot.sent] == [daily.TEXT_COPIED_HINT]
+    assert db.get_daily_state(conn, U)["missed_streak"] == 1
+
+
+async def test_compose_copy_of_sentence_is_retry_too(conn, fake_tts, monkeypatch):
+    _, tid, _, bot, result = await _copy_case(conn, fake_tts, monkeypatch, "compose", S)
+    assert result == "retry" and db.get_task(conn, tid)["status"] == "open"
+
+
+async def test_compose_hinted_answer_differing_by_words_is_graded_with_hint(conn, fake_tts, monkeypatch):
+    seen = {}
+
+    def fake(llm, profile, card, answer, avoid, hint=None):
+        seen["hint"] = hint
+        return dict(CHECK)
+    monkeypatch.setattr(sentences, "check_sentence", fake)
+    cid = _card(conn)
+    _open(conn, cid, "compose_hinted")
+    bot = FakeBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "Please give me a heads-up before the release.",
+                                   TODAY, giveup=False) == "done"
+    assert seen["hint"] == S
+
+
+async def test_gap_full_sentence_still_correct_after_copy_rule(conn, fake_tts, monkeypatch):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "gap")
+    assert await daily.answer_task(FakeBot(), conn, None, EN, U, S, TODAY, giveup=False) == "done"
+    assert db.get_task(conn, tid)["answered_ok"] == 1

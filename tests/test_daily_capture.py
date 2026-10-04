@@ -623,3 +623,20 @@ async def test_stale_task_answer_via_clarify_button_is_graded(conn, monkeypatch)
     assert answer.await_args.kwargs == {"giveup": False, "task_id": tid}
     assert answer.await_args.args[5] == "bridges span rivers"
     call.message.answer.assert_not_awaited()
+
+
+async def test_free_text_retry_answer_sends_nothing_extra(conn, monkeypatch):
+    monkeypatch.setattr(daily, "answer_task", AsyncMock(return_value="retry"))
+    _task(conn, _card(conn))
+    message = _message("I gave them a heads-up")
+    await daily_handlers.on_free_text(message, _state({}), conn, None, EN)
+    message.answer.assert_not_awaited()
+
+
+async def test_on_clarify_retry_answer_sends_nothing_extra(conn, monkeypatch):
+    monkeypatch.setattr(daily, "answer_task", AsyncMock(return_value="retry"))
+    live = _task(conn, _card(conn))
+    call = _call("clarify:answer:4")
+    await daily_handlers.on_clarify(call, _state({"pending": {"4": {"text": "ответ", "task_id": live}}}),
+                                    conn, None, EN)
+    call.message.answer.assert_not_awaited()

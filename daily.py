@@ -196,6 +196,7 @@ TEXT_GRADE_FAILED = "Не получилось проверить сейчас �
 TEXT_SAVED = "Сохранено ✅ — придёт завтра утром."
 TEXT_ONLY_TEXT = "Пока понимаю только текст: перешли сообщение или напиши фразу 🙂"
 TEXT_NOTHING_FOUND = "Не вижу, что тут взять 🙂 Напиши слово или фразу явно."
+TEXT_COPIED_HINT = "Это предложение из подсказки 🙂 Напиши своё — про что-нибудь из твоей жизни."
 TEXT_CLARIFY = "Это ответ на задание или новое слово?"
 TEXT_CLARIFY_STALE = "Это задание уже истекло, напиши ответ на новое 🙂"
 TEXT_EMPTY_CAPTURE = "После «+» напиши слово или фразу 🙂"
@@ -508,7 +509,7 @@ async def grade_answer(llm, profile, task, card, answer: str, *, giveup: bool,
     if kind in ("compose_hinted", "compose"):
         try:
             check = await asyncio.to_thread(sentences.check_sentence, llm, profile, card,
-                                            answer, avoid)
+                                            answer, avoid, sentence)
         except QuotaExceededError:
             check = None
         if check is None:
@@ -581,6 +582,8 @@ async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: d
 
     "done"  — ответ принят и обработан (в т.ч. сбой оценки / удалённая карточка);
     "stale" — задачи нет / чужая / утро успело её истечь: ответ НЕ применяется к новой;
+    "retry" — ответ скопирован с подсказки (compose/compose_hinted): задача снова open,
+              SRS и missed_streak не тронуты, TEXT_COPIED_HINT уже отправлен внутри;
     "busy"  — задача ещё жива, но уже не open (оценивается или отвечена): второй
               быстрый ответ — хендлер молча игнорирует.
     task_id — задача, которую хендлер видел до лока.
@@ -595,6 +598,11 @@ async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: d
         if card is None:
             await _close_deleted(bot, conn, user_id, task["id"])
             return "done"
+        if (not giveup and task["kind"] in ("compose", "compose_hinted") and task["sentence"]
+                and listen_ok(text, task["sentence"])):
+            db.release_task(conn, task["id"])   # (т): копия подсказки — не ответ
+            await _safe_send(bot, user_id, TEXT_COPIED_HINT)
+            return "retry"
         try:
             graded = await grade_answer(llm, profile, task, card, text, giveup=giveup,
                                         avoid=db.recent_sentences(conn, card["id"], n=3))

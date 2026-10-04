@@ -187,3 +187,20 @@ def test_check_sentence_reply_regeneration_gets_learner_sentence_as_context():
     assert "I made this bot to pursue my goal." in str(second)
     assert "ответ собеседнику" in str(second)
     assert CARD["context"] in str(second)
+
+
+def test_check_sentence_passes_hint_into_prompt():
+    client = MagicMock()
+    client.models.generate_content.return_value = _resp(CHECK)
+    sentences.check_sentence(_llm(client), EN, CARD, "I gave a heads-up.", [],
+                             hint="Can you give me a heads-up?")
+    sent = client.models.generate_content.call_args.kwargs["contents"]
+    assert "Подсказка (предложение из задания): Can you give me a heads-up?" in sent
+
+
+def test_check_sentence_without_hint_uses_dash():
+    client = MagicMock()
+    client.models.generate_content.return_value = _resp(CHECK)
+    sentences.check_sentence(_llm(client), EN, CARD, "I gave a heads-up.", [])
+    sent = client.models.generate_content.call_args.kwargs["contents"]
+    assert "Подсказка (предложение из задания): —" in sent

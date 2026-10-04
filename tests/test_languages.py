@@ -190,7 +190,7 @@ def test_en_templates_format_with_expected_keys():
                                          kind="gap", avoid="—")
     assert "a heads-up" in s and "gap" in s
     c = en.sentence_check_user_template.format(word="a heads-up", translation="п", context="к",
-                                               answer="I gave a heads-up.", avoid="—")
+                                               answer="I gave a heads-up.", avoid="—", hint="—")
     assert "I gave a heads-up." in c
 
 
@@ -223,3 +223,11 @@ def test_en_sentence_check_prompt_asks_reply_to_learner_sentence():
     en = PROFILES["en"]
     assert "ответная реплика собеседника" in en.sentence_check_system
     assert "what else are you planning" in en.sentence_check_system
+
+
+def test_en_check_prompt_knows_hint_and_copy_rule():
+    en = PROFILES["en"]
+    assert "{hint}" in en.sentence_check_user_template
+    assert "Подсказка (предложение из задания): {hint}" in en.sentence_check_user_template
+    assert "копией или лёгкой переделкой подсказки" in en.sentence_check_system
+    assert "это предложение из подсказки, нужно своё" in en.sentence_check_system

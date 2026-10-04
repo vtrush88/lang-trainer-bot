@@ -59,10 +59,10 @@ def fallback_sentence(card) -> dict | None:
 
 
 def check_sentence(llm: llm_service.LLM, profile: LanguageProfile, card, answer: str,
-                   avoid: list[str]) -> dict:
+                   avoid: list[str], hint: str | None = None) -> dict:
     user = profile.sentence_check_user_template.format(
         word=card["word"], translation=card["translation"], context=_topic(card),
-        answer=answer, avoid=_avoid_text(avoid))
+        answer=answer, avoid=_avoid_text(avoid), hint=hint or "—")
     data = None
     for _ in range(2):
         candidate = llm_service.generate_json(
