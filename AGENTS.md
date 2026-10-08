@@ -30,7 +30,7 @@ Victoria для теста); данные ключуются по `user_id`.
 
 Python 3.12 · **aiogram 3.13.1** (long-polling, MemoryStorage FSM) · **SQLite** (stdlib) ·
 **google-genai 2.8.0** (`gemini-3.5-flash`, фолбэк `gemini-3.5-flash-lite` — бесплатный тир) · **edge-tts 7.2.8** (`es-ES-XimenaNeural`) ·
-python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **371 тест.**
+python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **501 тест.**
 
 ## Структура
 
@@ -47,9 +47,12 @@ db.py             SQLite: cards (15 полей + context), CRUD, get_due_cards, 
 languages.py     языковые профили: голос, промпты, схемы Gemini, UI-строки; выбор через BOT_LANG;
                   + флаг daily_practice и три промпта EN (es байт-в-байт без изменений)
                   + флаг command_menu (en: без reply-клавиатуры, команды «/»)
-daily.py          ежедневная практика (en): чистая логика + тексты, send_daily_task / answer_task /
-                  daily_loop / capture_items (IO, per-user локи)
-handlers/daily.py тонкий роутер: /next, more:, take:, clarify:, свободный текст, не-текст
+clock.py          бизнес-дата: configure(tz_name) / today() / now(); bot.main настраивает DAILY_TZ для
+                  ОБОИХ ботов, везде «сегодня» = clock.today() (не date.today()), включая handlers/add|training
+daily.py          ежедневная практика (en): чистая логика + тексты, send_daily_task / _issue_locked /
+                  answer_task / daily_loop / capture_items (IO, per-user локи)
+handlers/daily.py тонкий роутер: /next (только новое слово), заглушка старых more:, take:, clarify:,
+                  свободный текст, не-текст
 handlers/commands.py команды «/» en-бота (/next /add /vocab /cards /check /listen) — без
                      StateFilter, делегируют в add/menu/training/daily; bot_commands() для меню «/»
 services/sentences.py  Gemini: предложение для задания + check_sentence (проверка ответа)
@@ -71,7 +74,7 @@ services/srs.py         чистая: next_interval (Leitner-лесенка) + d
 session.py        чистая: advance() — политика очереди внутри сессии (повтор ошибки)
 intents.py        чистая: is_giveup() — распознать «не помню/не знаю/не поняла»
 formatting.py     чистые функции текста сообщений (esc, field, «📍 контекст» в card_preview)
-keyboards.py      reply-меню (5 кнопок) + inline-клавиатуры (+ more/take/clarify); константы BTN_*
+keyboards.py      reply-меню (5 кнопок) + inline-клавиатуры (+ take/clarify); константы BTN_*
 states.py         FSM-состояния AddCard / Training + leave_modes/end_session (сохраняют seq)
 tests/            юнит-тесты (чистая логика + db + сервисы с моками; хендлеры — вызовом напрямую с моками aiogram, проводка роутеров — test_bot_wiring)
 ```
@@ -89,7 +92,7 @@ cp .env.example .env        # заполнить: TELEGRAM_TOKEN (@BotFather),
                             # GEMINI_API_KEY (Google AI Studio, бесплатно), ALLOWED_USER_IDS (свой tg id)
 python bot.py               # long-polling
 ```
-Тесты: `.venv/bin/pytest -q` (ожидается 371 passed).
+Тесты: `.venv/bin/pytest -q` (ожидается 501 passed).
 Секреты (`.env`), БД (`spanish_bot.db`), `.venv` — в `.gitignore`, не коммитить.
 
 **Деплой на сервер:** пошаговый ран-бук — `docs/superpowers/deploy.md`
@@ -134,10 +137,26 @@ python bot.py               # long-polling
 - `daily_tasks.status='grading'` на старте — зомби, снимается `release_stale_grading`;
   `DAILY_AT` вне 05:00–13:59 — WARNING в логе, не ошибка; `generate_json` отдаёт только
   dict — массивы заворачивать в объект.
-- Daily (en): задание от `/next`/«Ещё одно» через 15 мин (`daily.NEXT_TASK_TTL`, колонка
-  `daily_tasks.issued_at` ISO UTC, NULL у старых строк = свежее) — режим «переспросить»:
-  любой текст → кнопки «Ответ / Новое слово», а `/next` выдаёт новое; утренние не стареют.
-  Плюс английский ≥ 6 слов без слова задания тоже переспрашивается (дельта (р) спеки).
+- Daily (en): задание, выданное по `/next` (`daily_tasks.requested = 1`, ставит только `/next`), через 15 мин
+  (`daily.NEXT_TASK_TTL`, колонка `daily_tasks.issued_at` ISO UTC, NULL у старых строк = свежее) — режим
+  «переспросить»: любой текст → кнопки «Ответ / Новое слово». Утренние и задания цепочки не стареют
+  (`is_stale` False при `requested = 0`). `/next` больше НЕ истекает старое задание: при открытом
+  повторно шлёт его и обновляет `issued_at` (`db.touch_task_issued_at`), иначе ответ сразу попал бы в
+  «переспрос». Английский ≥ 6 слов без слова задания тоже переспрашивается (дельта (р) спеки; см. также (у)).
+- Daily расписание (2026-10-08): выдача — `daily._issue_locked` (под `user_lock`); цепочка после ответа
+  из `answer_task` зовёт именно её с датой `clock.today()`, взятой заново под тем же локом — НЕ
+  `send_daily_task` (он берёт тот же не-реентерабельный лок → дедлок; тест на реальном `user_lock`).
+  Приоритет: повтор (`db.pick_due_repeat`, ≤ `MAX_REPEATS_PER_DAY = 5` за день) → новое слово только когда
+  повторов нет (в день долга при исчерпанном лимите нового нет). Новое: `db.pick_new_card` (сначала ни разу не
+  выдававшиеся, свежие первыми), норма `NEW_PER_WEEK = 2` за ISO-неделю (`db.count_new_since` —
+  `COUNT(DISTINCT card_id)`) и `NEW_MIN_GAP_DAYS = 3` (`db.last_new_on`). Норма считается по
+  `daily_tasks.is_new`; `init_db` на КАЖДОМ старте делает backfill
+  `is_new = 1 WHERE kind = 'compose_hinted'` (идемпотентно, пережёт падение между ALTER и UPDATE).
+  `send_daily_task(..., want_new=...)` → `sent|resent|nothing|later|tomorrow|failed`; `/next` —
+  `want_new=True`, только новые слова, тексты `TEXT_NEXT_LATER/TOMORROW/TEXT_NO_NEW_WORDS/TEXT_NEXT_FAILED`
+  (доступность проверяется раньше нормы). Цепочка — после каждого доставленного результата (и «не помню»,
+  и «фраза удалена»), не после «попробуй ещё»; `_send_result`/`_safe_send` возвращают `bool`.
+  Старые кнопки `more:` → `TEXT_MORE_GONE`.
 - Synchronous Gemini-клиент в async-хендлерах обёрнут в `asyncio.to_thread` —
   не разворачивай обратно в прямой вызов, иначе loop блокируется на ~1–5 с на запрос.
 - Колонки cards переименованы на нейтральные (word/translation/example/example_translation,
@@ -151,7 +170,7 @@ python bot.py               # long-polling
   преподавателем и закрепляет лексику с уроков, поэтому словарь сугубо личный.
 - **Простота — главное ограничение** (мама почти не дружит с техникой): любую фичу
   мерить по «не усложнит ли ей». Сложное (SRS) прячем за минимум кнопок.
-- **es — pull-режим без пуш.** **en — одно утреннее задание в день** (`DAILY_AT` в `.env`, цепочка «Ещё одно» до 3/день, тихий режим после 3 пропусков) + сбор фраз из пересланного текста с контекстом. Спека `docs/superpowers/specs/2026-09-30-daily-practice-design.md`.
+- **es — pull-режим без пуш.** **en — одно утреннее задание в день** (`DAILY_AT` в `.env`, повторы приходят цепочкой после ответа (≤5/день), новое слово ≤2/нед и не чаще раза в 3 дня, `/next` — только новое слово, тихий режим после 3 пропусков) + сбор фраз из пересланного текста с контекстом. Спека `docs/superpowers/specs/2026-09-30-daily-practice-design.md`.
 - **Испанский Испании** (peninsular): лексика/примеры пиренейские (coche/ordenador/zumo,
   НЕ carro/computadora/jugo); голос `es-ES-XimenaNeural`. Промпт enrichment это задаёт.
 - **Транскрипция — простая, русскими буквами**, с явными правилами звуков:
@@ -236,15 +255,20 @@ python bot.py               # long-polling
 `docs/superpowers/specs/2026-09-30-daily-practice-design.md` — **с 2026-10-04 продуктовая, простым
 языком** (решение Victoria: спеки пишутся с точки зрения пользователя, вся техника — в плане);
 план `docs/superpowers/plans/2026-10-02-daily-practice.md` — технический дизайн, журнал ревью и дельты
-реализации (а)–(т) живут в его **приложении A**. Правило для новых спек этого репо то же.
+реализации (а)–(у) живут в его **приложении A**. Правило для новых спек этого репо то же.
 Суть: бот сам пишет утром одно задание по одной фразе (своё предложение / пропуск / вспомнить /
-услышать) в новом предложении в контексте фразы; сбор фраз пересланным текстом; цепочка «Ещё одно»
-до 3/день; тихий режим после 3 пропусков. Только `BOT_LANG=en` (гейт профилем + `DAILY_AT`);
+услышать) в новом предложении в контексте фразы; сбор фраз пересланным текстом; повторы цепочкой
+после ответа; тихий режим после 3 пропусков. Только `BOT_LANG=en` (гейт профилем + `DAILY_AT`);
 es-бот не меняется. Решения брейншторма («не улучшать карточки», вариант А→Б, ступени 1↔3,
 ёмкость 2 фразы/нед) — в спеке, не переоткрывать.
+**Расписание повторов и новых слов (2026-10-08, ветка `daily-scheduling`, в рабочей копии, не
+закоммичено и не задеплоено; 501 тест):** причина — 5 утр подряд только новые слова. Повторы раньше
+новых, ≤5 в день, цепочка после ответа; новые ≤2 в неделю, ≥3 дня между; `/next` только новое
+слово; кнопки «Ещё одно» и `MAX_TASKS_PER_DAY` нет. Бизнес-дата — `clock.py`. План
+`docs/superpowers/plans/2026-10-08-daily-scheduling.md`; выкат — `deploy.md`, «Ежедневная практика
+(en-бот)».
 Хвосты (после деплоя / на финальном ревью ветки):
 - `daily.py` ~590 строк смешивает чистую логику и IO — кандидат на разделение.
-- Текст отказа `/next` переиспользует формулировку отказа сбора фраз.
 
 **En-бот без reply-клавиатуры, меню через «/» (2026-10-03, в рабочей копии, не задеплоено):**
 решение Victoria — у @EnglishUpgradeBot пять кнопок убраны совсем, разделы — командами Telegram
