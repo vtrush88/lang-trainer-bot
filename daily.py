@@ -1,4 +1,6 @@
-"""Ежедневная практика: чистая логика (эта часть) + IO (добавляется в Task 10–12).
+"""Ежедневная практика (en-бот): чистая логика (виды заданий, норма новых слов, классификация
+свободного текста, рендеры) + IO (выдача заданий и цепочка повторов под user_lock, утренний
+цикл, оценка ответов, сбор фраз из пересланного текста).
 
 Спека: docs/superpowers/specs/2026-09-30-daily-practice-design.md.
 """
@@ -15,27 +17,36 @@ import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
 
+import clock
 import db
 import formatting
 import intents
-import keyboards
 import voice
 from formatting import esc, field
 from services import capture, grading, sentences, srs, tts
 from services.llm import QuotaExceededError
 
 VOICE_KINDS = frozenset({"compose_hinted", "listen"})
-MAX_TASKS_PER_DAY = 3
+MAX_REPEATS_PER_DAY = 5
+NEW_PER_WEEK = 2
+NEW_MIN_GAP_DAYS = 3
 MISSED_QUIET_AFTER = 3
 QUIET_PERIOD_DAYS = 7
 WORD_RATIO = 0.8
 GIVEUP_MAX_WORDS = 4
 CLARIFY_MIN_WORDS = 6                    # длинный английский без слова задания → переспросить
-NEXT_TASK_TTL = timedelta(minutes=15)    # /next и «Ещё одно» после этого — «переспросить»
+NEXT_TASK_TTL = timedelta(minutes=15)    # только задание по /next (requested) — потом «переспросить»
+
+rng = random.Random()                    # дефолтный генератор выдачи
+
+
+def _module_rng() -> random.Random:
+    """Текущий модульный `rng` (читается при вызове — monkeypatch daily.rng в тестах работает);
+    нужен там, где параметр `rng` затеняет модульное имя."""
+    return rng
 
 _KIND_BY_RUNG = {0: "compose_hinted", 1: "gap", 3: "recall", 7: "listen", 14: "compose"}
 _MIXED_KINDS = ("recall", "gap", "listen", "compose")
@@ -58,6 +69,36 @@ def should_send(missed_streak: int, last_sent_on: str | None, today: date) -> bo
     if missed_streak < MISSED_QUIET_AFTER or not last_sent_on:
         return True
     return (today - date.fromisoformat(last_sent_on)).days >= QUIET_PERIOD_DAYS
+
+
+def week_start(today: date) -> date:
+    """Понедельник ISO-недели, в которую попадает today."""
+    return today - timedelta(days=today.weekday())
+
+
+def new_word_allowed(*, count_this_week: int, last_new: date | None, today: date) -> bool:
+    if count_this_week >= NEW_PER_WEEK:
+        return False
+    return last_new is None or (today - last_new).days >= NEW_MIN_GAP_DAYS
+
+
+def days_until_new_word(*, count_this_week: int, last_new: date | None, today: date) -> int:
+    gap_wait = 0 if last_new is None else max(0, NEW_MIN_GAP_DAYS - (today - last_new).days)
+    week_wait = 0
+    if count_this_week >= NEW_PER_WEEK:
+        week_wait = (week_start(today) + timedelta(days=7) - today).days
+    return max(gap_wait, week_wait)
+
+
+def when_text(days: int) -> str:
+    if days == 1:
+        return "завтра"
+    if days % 100 not in (11, 12, 13, 14):
+        if days % 10 == 1:
+            return f"через {days} день"
+        if days % 10 in (2, 3, 4):
+            return f"через {days} дня"
+    return f"через {days} дней"
 
 
 def downgrade_kind(kind: str, *, has_sentence: bool, has_voice: bool) -> str:
@@ -106,10 +147,10 @@ _bad_issued_at_warned: set = set()   # id задач, про битый issued_a
 
 
 def is_stale(task, now: datetime) -> bool:
-    """Задание от /next или «Ещё одно» старше NEXT_TASK_TTL. Утренние — никогда (ждут весь
-    день); issued_at NULL (строки до дельты (р)) — не stale; naive-время считаем UTC;
+    """Задание, явно запрошенное через /next (requested), старше NEXT_TASK_TTL. Утренние и
+    задания цепочки — никогда (ждут весь день); issued_at NULL (строки до дельты (р)) — не stale; naive-время считаем UTC;
     нечитаемая строка — не stale (одно предупреждение в лог на задачу)."""
-    if task["morning"] or not task["issued_at"]:
+    if task["morning"] or not task["requested"] or not task["issued_at"]:
         return False
     try:
         issued = datetime.fromisoformat(task["issued_at"])
@@ -187,13 +228,15 @@ def should_start_loop(profile, cfg) -> bool:
 
 # ---- Рендеры: тексты заданий и результатов (чистые, HTML для parse_mode="HTML") ----
 VOICE_UNAVAILABLE = "🔇 (озвучка временно недоступна)"
-TEXT_NOTHING_NEXT = "Пока нечего повторять: все фразы ещё не подошли 🙂 Перешли что-нибудь новое."
-TEXT_MORE_STALE = "Это было вчера 🙂 Утром пришлю новое."
-TEXT_MORE_LIMIT = "На сегодня хватит, завтра продолжим 🙂"
-TEXT_MORE_EMPTY = "Пока всё повторили 🎉"
+TEXT_NEXT_LATER = "Новое слово будет {when} 🙂"
+TEXT_NEXT_TOMORROW = "Сохранённое сегодня придёт завтра 🙂"
+TEXT_NEXT_SAVED_WHEN = "Сохранённое сегодня придёт {when} 🙂"   # норма/интервал пустят позже
+TEXT_NO_NEW_WORDS = "Новых слов нет — перешли что-нибудь 🙂"
+TEXT_MORE_GONE = "Эта кнопка больше не нужна — задания теперь приходят сами 🙂"
+TEXT_NEXT_FAILED = "Не получилось выдать задание сейчас 😕 Попробуй /next через минутку."
 TEXT_CARD_DELETED = "Эта фраза уже удалена 🙂"
 TEXT_GRADE_FAILED = "Не получилось проверить сейчас 😕 Напиши ещё раз через минутку."
-TEXT_SAVED = "Сохранено ✅ — придёт завтра утром."
+TEXT_SAVED = "Сохранено ✅ — придёт с ближайшим новым словом."
 TEXT_ONLY_TEXT = "Пока понимаю только текст: перешли сообщение или напиши фразу 🙂"
 TEXT_NOTHING_FOUND = "Не вижу, что тут взять 🙂 Напиши слово или фразу явно."
 TEXT_COPIED_HINT = "Это предложение из подсказки 🙂 Напиши своё — про что-нибудь из твоей жизни."
@@ -409,59 +452,104 @@ def _prepared_from_task(task) -> Prepared:
 
 
 async def send_daily_task(bot, conn, llm, profile, user_id: int, today: date,
-                          rng: random.Random, *, morning: bool,
-                          limit: int | None = None) -> str:
-    """Выдать задание. "sent" | "resent" | "nothing" | "failed" | "limit". Целиком под локом."""
+                          rng: random.Random | None = None, *, morning: bool = False,
+                          want_new: bool = False) -> str:
+    """Выдать задание под локом пользователя (см. _issue_locked).
+
+    "sent" | "resent" | "nothing" | "later" | "tomorrow" | "failed"."""
+    if rng is None:
+        rng = _module_rng()
     async with user_lock(user_id):
-        if limit is not None and db.count_tasks_on(conn, user_id, today) >= limit:
-            return "limit"          # потолок дня — раньше любого повтора (контракт «Ещё одно»)
-        active = db.open_task(conn, user_id)
-        if active is not None:
-            if morning:
-                if active["sent_on"] == today.isoformat():
-                    return "nothing"   # сегодняшнее уже выдано (/next перед DAILY_AT) — не истекаем
-                # include_grading: под локом grading — зомби (сбой без рестарта)
-                was_morning = db.expire_task(conn, active["id"], include_grading=True)
-                if was_morning:
-                    db.bump_missed(conn, user_id)
-            else:
-                # /next через 15 минут: старое тихо истекает (не утреннее — без bump), выдаём новое
-                replaced = is_stale(active, _utcnow()) and db.expire_task(conn, active["id"]) is not None
-                if not replaced:
-                    card = db.get_card(conn, active["card_id"])
-                    if card is not None:
-                        try:
-                            final_kind = await deliver(bot, conn, profile, user_id,
-                                                       _prepared_from_task(active), card)
-                        except TELEGRAM_SEND_ERRORS as exc:
-                            log.warning("resend to %s failed: %s", user_id, exc)
-                            return "failed"
-                        if final_kind != active["kind"]:
-                            db.set_task_kind(conn, active["id"], final_kind)
-                        return "resent"
-                    db.expire_task(conn, active["id"])   # карточка удалена — задача мертва
+        return await _issue_locked(bot, conn, llm, profile, user_id, today, rng,
+                                   morning=morning, want_new=want_new, chain=False)
+
+
+def _nothing(user_id: int, reason: str) -> str:
+    """Каждый "nothing" выдачи — с причиной в логе (иначе «почему сегодня тишина» не понять)."""
+    log.info("daily %s: nothing — %s", user_id, reason)
+    return "nothing"
+
+
+async def _issue_locked(bot, conn, llm, profile, user_id: int, today: date, rng: random.Random,
+                        *, morning: bool, want_new: bool, chain: bool) -> str:
+    """Ядро выдачи; вызывается УЖЕ под user_lock (лок не реентерабельный — цепочка из
+    answer_task зовёт эту функцию, а не send_daily_task).
+
+    Порядок: открытая задача → тихий режим (утро) → повтор (если не want_new; потолок
+    MAX_REPEATS_PER_DAY, в день долга нового слова нет) → новое слово по недельной норме."""
+    active = db.open_task(conn, user_id)
+    expired_prev = False
+    if active is not None:
+        if chain:   # страховка: задачу только что закрыли под этим же локом
+            return _nothing(user_id, "chain guard: a task is still open")
         if morning:
-            st = db.get_daily_state(conn, user_id)
-            if not should_send(st["missed_streak"], st["last_sent_on"], today):
-                return "nothing"
-        card = db.pick_due_card(conn, user_id, today)
-        if card is None:
-            return "nothing"
-        prepared = await prepare_task(conn, llm, profile, card, rng)
-        try:
-            final_kind = await deliver(bot, conn, profile, user_id, prepared, card)
-        except TELEGRAM_SEND_ERRORS as exc:
-            log.warning("send to %s failed: %s", user_id, exc)
-            return "failed"
-        db.create_task(conn, user_id=user_id, card_id=card["id"], kind=final_kind,
-                       sentence=prepared.sentence, sentence_ru=prepared.sentence_ru,
-                       phrase_form=prepared.phrase_form, from_example=prepared.from_example,
-                       today=today, morning=morning, issued_at=_utcnow())
-        log.info("daily task for %s: card %s, kind %s%s", user_id, card["id"], final_kind,
-                 " (morning)" if morning else "")
-        if morning:
-            db.set_last_sent(conn, user_id, today)
-        return "sent"
+            if active["sent_on"] == today.isoformat():
+                # сегодняшнее уже выдано (/next перед DAILY_AT) — не истекаем
+                return _nothing(user_id, "open task from today")
+            # include_grading: под локом grading — зомби (сбой без рестарта)
+            was_morning = db.expire_task(conn, active["id"], include_grading=True)
+            expired_prev = True
+            if was_morning:
+                db.bump_missed(conn, user_id)
+        else:
+            card = db.get_card(conn, active["card_id"])
+            if card is not None:   # /next при открытой задаче — только повторить её
+                try:
+                    final_kind = await deliver(bot, conn, profile, user_id,
+                                               _prepared_from_task(active), card)
+                except TELEGRAM_SEND_ERRORS as exc:
+                    log.warning("resend to %s failed: %s", user_id, exc)
+                    return "failed"
+                if final_kind != active["kind"]:
+                    db.set_task_kind(conn, active["id"], final_kind)
+                # свежий issued_at: ответ сразу после /next не попадёт в «переспрос»
+                db.touch_task_issued_at(conn, active["id"], _utcnow())
+                return "resent"
+            db.expire_task(conn, active["id"])   # карточка удалена — задача мертва
+    if morning:
+        st = db.get_daily_state(conn, user_id)
+        if not should_send(st["missed_streak"], st["last_sent_on"], today):
+            return _nothing(user_id, "quiet mode" + (" (expired yesterday's open task first)"
+                                                     if expired_prev else ""))
+    card = None
+    if not want_new:
+        repeat = db.pick_due_repeat(conn, user_id, today)
+        if repeat is not None:
+            if db.count_repeats_on(conn, user_id, today) >= MAX_REPEATS_PER_DAY:
+                # долг повторов важнее нового слова — остаток завтра
+                return _nothing(user_id, "repeat cap reached, repeats remain for tomorrow")
+            card = repeat
+    is_new = card is None
+    if is_new:
+        allowed = (db.count_new_on(conn, user_id, today) == 0
+                   and new_word_allowed(
+                       count_this_week=db.count_new_since(conn, user_id, week_start(today), today),
+                       last_new=db.last_new_on(conn, user_id), today=today))
+        card = db.pick_new_card(conn, user_id, today)
+        if card is None:   # наличие раньше нормы: «будет через N дней» без слов — неправда
+            if want_new and db.has_new_cards_created_on(conn, user_id, today):
+                return "tomorrow"
+            return _nothing(user_id, "no due repeat and no new card")
+        if not allowed:
+            if want_new:
+                return "later"
+            return _nothing(user_id, "new-word quota or 3-day gap")
+    prepared = await prepare_task(conn, llm, profile, card, rng)
+    try:
+        final_kind = await deliver(bot, conn, profile, user_id, prepared, card)
+    except TELEGRAM_SEND_ERRORS as exc:
+        log.warning("send to %s failed: %s", user_id, exc)
+        return "failed"
+    db.create_task(conn, user_id=user_id, card_id=card["id"], kind=final_kind,
+                   sentence=prepared.sentence, sentence_ru=prepared.sentence_ru,
+                   phrase_form=prepared.phrase_form, from_example=prepared.from_example,
+                   today=today, morning=morning, issued_at=_utcnow(), is_new=is_new,
+                   requested=want_new)
+    log.info("daily task for %s: card %s, kind %s%s%s", user_id, card["id"], final_kind,
+             " (new)" if is_new else "", " (morning)" if morning else "")
+    if morning:
+        db.set_last_sent(conn, user_id, today)
+    return "sent"
 
 
 async def run_morning(bot, conn, llm, profile, user_ids: Iterable[int], today: date,
@@ -475,17 +563,16 @@ async def run_morning(bot, conn, llm, profile, user_ids: Iterable[int], today: d
 
 
 async def daily_loop(bot, conn, llm, profile, cfg) -> None:
-    tz = ZoneInfo(cfg.daily_tz)
-    rng = random.Random()
+    """Зону настраивает bot.main (clock.configure) — единственный владелец; здесь только чтение."""
     while True:
-        now = datetime.now(tz)
+        now = clock.now()
         target = next_fire(now, cfg.daily_at.hour, cfg.daily_at.minute)
         delay = fire_delay(now, target)
         log.info("daily loop: next fire %s (in %.0fs)", target, delay)
         await asyncio.sleep(delay)
         try:
             await run_morning(bot, conn, llm, profile,
-                              cfg.allowed_user_ids - cfg.daily_exclude_ids, datetime.now(tz).date(), rng)
+                              cfg.allowed_user_ids - cfg.daily_exclude_ids, clock.today(), rng)
         except Exception:
             log.exception("daily run failed")
 
@@ -542,42 +629,60 @@ async def grade_answer(llm, profile, task, card, answer: str, *, giveup: bool,
     raise ValueError(f"unknown kind {kind!r}")
 
 
-def more_button_allowed(conn, user_id: int, today: date) -> bool:
-    return (db.count_tasks_on(conn, user_id, today) < MAX_TASKS_PER_DAY
-            and db.pick_due_card(conn, user_id, today) is not None)
-
-
-async def _send_result(bot, conn, profile, chat_id: int, card, graded: Graded, markup) -> None:
-    """Результат — ОДНО сообщение: голос с подписью, иначе текст."""
+async def _send_result(bot, conn, profile, chat_id: int, card, graded: Graded) -> bool:
+    """Результат — ОДНО сообщение: голос с подписью, иначе текст. True — доставлен."""
     caption = fit_caption(graded.text)
-    if graded.speak and graded.speak != card["word"]:
-        mp3 = await _synthesize_tmp(graded.speak, profile.tts_voice)
-        if mp3 is not None:
-            try:
-                await voice.send_text_voice(bot, chat_id, mp3, caption=caption,
-                                            parse_mode="HTML", reply_markup=markup)
-                return
-            finally:
-                if os.path.exists(mp3):
-                    os.remove(mp3)
-    elif graded.speak:
-        sent = await voice.send_card_voice_to(bot, chat_id, conn, card, profile.tts_voice,
-                                              caption=caption, parse_mode="HTML",
-                                              reply_markup=markup)
-        if sent is not None:
-            return
-    await bot.send_message(chat_id, graded.text, parse_mode="HTML", reply_markup=markup)
+    try:
+        if graded.speak and graded.speak != card["word"]:
+            mp3 = await _synthesize_tmp(graded.speak, profile.tts_voice)
+            if mp3 is not None:
+                try:
+                    await voice.send_text_voice(bot, chat_id, mp3, caption=caption,
+                                                parse_mode="HTML")
+                    return True
+                finally:
+                    if os.path.exists(mp3):
+                        os.remove(mp3)
+        elif graded.speak:
+            sent = await voice.send_card_voice_to(bot, chat_id, conn, card, profile.tts_voice,
+                                                  caption=caption, parse_mode="HTML")
+            if sent is not None:
+                return True
+        await bot.send_message(chat_id, graded.text, parse_mode="HTML")
+        return True
+    except TELEGRAM_SEND_ERRORS as exc:
+        log.warning("result to %s not delivered: %s", chat_id, exc)
+        return False
 
 
-async def _safe_send(bot, chat_id: int, text: str) -> None:
+async def _safe_send(bot, chat_id: int, text: str) -> bool:
     try:
         await bot.send_message(chat_id, text)
+        return True
     except TELEGRAM_SEND_ERRORS as exc:
         log.warning("message to %s not delivered: %s", chat_id, exc)
+        return False
+
+
+async def _chain_next(bot, conn, llm, profile, user_id: int, rng: random.Random) -> None:
+    """Следующее задание после доставленного результата — под ТЕМ ЖЕ локом (через
+    _issue_locked, не send_daily_task: asyncio.Lock не реентерабелен). Дата берётся заново:
+    ответ, начатый до полуночи, не выдаёт задание вчерашним днём. Сбой — только лог."""
+    try:
+        result = await _issue_locked(bot, conn, llm, profile, user_id, clock.today(), rng,
+                                     morning=False, want_new=False, chain=True)
+    except Exception:
+        log.warning("chain for %s crashed", user_id, exc_info=True)
+        return
+    if result == "failed":
+        log.warning("chain for %s: next task not delivered", user_id)
+    else:
+        log.info("chain for %s → %s", user_id, result)
 
 
 async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: date,
-                      *, giveup: bool, task_id: int | None = None) -> str:
+                      *, giveup: bool, task_id: int | None = None,
+                      rng: random.Random | None = None) -> str:
     """claim -> оценка -> перечитать карточку -> SRS -> finish -> отправка, всё под локом.
 
     "done"  — ответ принят и обработан (в т.ч. сбой оценки / удалённая карточка);
@@ -587,7 +692,12 @@ async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: d
     "busy"  — задача ещё жива, но уже не open (оценивается или отвечена): второй
               быстрый ответ — хендлер молча игнорирует.
     task_id — задача, которую хендлер видел до лока.
+
+    После доставленного результата ("done", кроме сбоя оценки) — цепочка: следующий
+    повтор/новое слово на сегодня (_chain_next), её исход на результат не влияет.
     """
+    if rng is None:
+        rng = _module_rng()
     async with user_lock(user_id):
         task = db.get_task(conn, task_id) if task_id is not None else db.open_task(conn, user_id)
         if task is None or task["user_id"] != user_id or task["status"] == db.TASK_EXPIRED:
@@ -596,7 +706,8 @@ async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: d
             return "busy"
         card = db.get_card(conn, task["card_id"])
         if card is None:
-            await _close_deleted(bot, conn, user_id, task["id"])
+            if await _close_deleted(bot, conn, user_id, task["id"]):
+                await _chain_next(bot, conn, llm, profile, user_id, rng)
             return "done"
         if (not giveup and task["kind"] in ("compose", "compose_hinted") and task["sentence"]
                 and listen_ok(text, task["sentence"])):
@@ -613,7 +724,8 @@ async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: d
             return "done"
         fresh = db.get_card(conn, card["id"])   # могли удалить/повторить, пока думал Gemini
         if fresh is None:
-            await _close_deleted(bot, conn, user_id, task["id"])
+            if await _close_deleted(bot, conn, user_id, task["id"]):
+                await _chain_next(bot, conn, llm, profile, user_id, rng)
             return "done"
         if fresh["due_at"] <= today.isoformat():   # иначе ручная тренировка уже засчитала
             interval = srs.next_interval(fresh["interval_days"], graded.ok)
@@ -621,18 +733,16 @@ async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: d
                              due_at=srs.due_on(today, interval), remembered=graded.ok)
         db.finish_task(conn, task["id"], ok=graded.ok, reply_sentence=graded.reply_sentence)
         db.reset_missed(conn, user_id)
-        markup = keyboards.more_keyboard(today) if more_button_allowed(conn, user_id, today) else None
-        try:
-            await _send_result(bot, conn, profile, user_id, fresh, graded, markup)
-        except TELEGRAM_SEND_ERRORS as exc:
-            log.warning("result to %s not delivered: %s", user_id, exc)
+        if await _send_result(bot, conn, profile, user_id, fresh, graded):
+            await _chain_next(bot, conn, llm, profile, user_id, rng)
         return "done"
 
 
-async def _close_deleted(bot, conn, user_id: int, task_id: int) -> None:
+async def _close_deleted(bot, conn, user_id: int, task_id: int) -> bool:
+    """Закрыть задачу удалённой карточки; True — уведомление доставлено."""
     db.finish_task(conn, task_id, ok=False)
     db.reset_missed(conn, user_id)   # ответ был — тихий режим снимается
-    await _safe_send(bot, user_id, TEXT_CARD_DELETED)
+    return await _safe_send(bot, user_id, TEXT_CARD_DELETED)
 
 
 # ---- IO: сбор фраз из свободного текста ----

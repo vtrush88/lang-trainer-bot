@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
-
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -83,12 +81,6 @@ def card_detail_keyboard(card_id: int, page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{card_id}:{page}"),
         InlineKeyboardButton(text="◀ К списку", callback_data=f"vocab:{page}"),
-    ]])
-
-
-def more_keyboard(today: date) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="➕ Ещё одно", callback_data=f"more:{today.isoformat()}")
     ]])
 
 

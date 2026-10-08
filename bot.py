@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from google import genai
 from google.genai import types as genai_types
 
+import clock
 import config
 import daily
 import db
@@ -72,6 +73,8 @@ async def setup_commands(bot, profile: languages.LanguageProfile) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = config.load()
+    # Бизнес-дата (DAILY_TZ) для обоих ботов — ДО всего, что берёт «сегодня»; единственный владелец.
+    clock.configure(cfg.daily_tz)
 
     conn = db.connect(cfg.db_path)
     prepare_db(conn)

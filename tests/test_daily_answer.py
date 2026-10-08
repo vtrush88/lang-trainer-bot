@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import clock
 import daily
 import db
 from languages import PROFILES
@@ -17,6 +18,12 @@ EN = PROFILES["en"]
 U = 111
 TODAY = date(2026, 10, 5)
 S = "Can you give me a heads-up before you merge?"
+
+
+@pytest.fixture(autouse=True)
+def _business_today(monkeypatch):
+    """Цепочка берёт дату из clock.today() — держим её равной TODAY тестов."""
+    monkeypatch.setattr(clock, "today", lambda: TODAY)
 
 
 def _open(conn, cid, kind, *, sentence=S, phrase_form="a heads-up", morning=True, today=TODAY):
@@ -196,29 +203,6 @@ async def test_card_deleted_before_answer(conn, fake_tts, monkeypatch):
     assert db.get_daily_state(conn, U)["missed_streak"] == 0
 
 
-async def test_morning_during_grading_waits_for_lock(conn, fake_tts, monkeypatch):
-    """Утренняя выдача, пришедшая во время оценки, ждёт лок: задачу не истекает, пропуск не растёт."""
-    async def slow_to_thread(fn, *args, **kwargs):
-        await asyncio.sleep(0.02)
-        return fn(*args, **kwargs)
-    monkeypatch.setattr(asyncio, "to_thread", slow_to_thread)
-    monkeypatch.setattr(sentences, "check_sentence", lambda *a, **k: {**CHECK, "reply_sentence": None})
-    monkeypatch.setattr(sentences, "make_sentence", lambda *a, **k: {"sentence": "S2", "sentence_ru": "r",
-                                                                      "phrase_form": "second"})
-    cid = _card(conn)
-    tid = _open(conn, cid, "compose_hinted", today=date(2026, 10, 4))
-    _card(conn, word="second", example="A second one.")
-    bot = FakeBot()
-    answer = asyncio.create_task(daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False))
-    await asyncio.sleep(0)   # answer_task успел взять лок и уйти в оценку
-    morning = asyncio.create_task(daily.send_daily_task(bot, conn, None, EN, U, TODAY,
-                                                        random.Random(1), morning=True))
-    await asyncio.gather(answer, morning)
-    assert db.get_task(conn, tid)["status"] == "answered"       # не expired
-    assert db.get_daily_state(conn, U)["missed_streak"] == 0
-    assert db.open_task(conn, U)["card_id"] != cid               # утро выдало следующую карточку
-
-
 async def test_grading_failure_releases_task(conn, fake_tts, monkeypatch):
     def boom(*a, **k):
         raise sentences.SentenceError("junk")
@@ -240,38 +224,6 @@ async def test_send_failure_after_finish_keeps_srs(conn, fake_tts, monkeypatch):
     await daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False)
     assert db.get_task(conn, tid)["status"] == "answered"
     assert db.get_card(conn, cid)["reps"] == 1
-
-
-async def test_more_button_only_when_queue_and_limit_allow(conn, fake_tts, monkeypatch):
-    monkeypatch.setattr(sentences, "check_sentence", lambda *a, **k: {**CHECK, "reply_sentence": None})
-    cid = _card(conn)
-    _card(conn, word="another one", example="Another one here.")
-    _open(conn, cid, "compose_hinted")
-    bot = FakeBot()
-    await daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False)
-    assert bot.sent[-1][3]["reply_markup"].inline_keyboard[0][0].callback_data == "more:2026-10-05"
-    # очередь пуста → кнопки нет
-    cid3 = _card(conn, word="third", example="Third one here.")
-    for w in ("another one",):
-        row = conn.execute("SELECT id FROM cards WHERE word = ?", (w,)).fetchone()
-        db.update_review(conn, row["id"], interval_days=30, due_at=date(2026, 11, 5), remembered=True)
-    db.update_review(conn, cid3, interval_days=30, due_at=date(2026, 11, 5), remembered=True)
-    _open(conn, cid, "compose", sentence=None, phrase_form=None, morning=False)
-    await daily.answer_task(bot, conn, None, EN, U, "y", TODAY, giveup=False)
-    assert bot.sent[-1][3].get("reply_markup") is None
-
-
-async def test_more_button_hidden_at_daily_limit(conn, fake_tts, monkeypatch):
-    monkeypatch.setattr(sentences, "check_sentence", lambda *a, **k: {**CHECK, "reply_sentence": None})
-    cid = _card(conn)
-    _card(conn, word="another one", example="Another one here.")
-    for _ in range(2):   # две уже выданы и закрыты сегодня
-        t = _open(conn, cid, "compose", sentence=None, phrase_form=None, morning=False)
-        db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
-    _open(conn, cid, "compose", sentence=None, phrase_form=None, morning=False)   # третья
-    bot = FakeBot()
-    await daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False)
-    assert bot.sent[-1][3].get("reply_markup") is None
 
 
 async def test_recall_quota_shows_expected_and_counts_wrong(conn, fake_tts, monkeypatch):
@@ -297,10 +249,6 @@ async def test_compose_avoid_comes_from_recent_sentences(conn, fake_tts, monkeyp
     _open(conn, cid, "compose_hinted")
     await daily.answer_task(FakeBot(), conn, None, EN, U, "x", TODAY, giveup=False)
     assert seen["avoid"] == [S]
-
-
-def test_more_button_allowed_false_without_due_card(conn):
-    assert daily.more_button_allowed(conn, U, TODAY) is False
 
 
 async def test_answer_for_task_in_grading_is_busy_not_stale(conn, fake_tts, monkeypatch):
@@ -397,3 +345,244 @@ async def test_gap_full_sentence_still_correct_after_copy_rule(conn, fake_tts, m
     tid = _open(conn, cid, "gap")
     assert await daily.answer_task(FakeBot(), conn, None, EN, U, S, TODAY, giveup=False) == "done"
     assert db.get_task(conn, tid)["answered_ok"] == 1
+
+
+# ---- Task 3: цепочка повторов после ответа ----
+
+GOOD_SENT = {"sentence": "Second sentence for the next card.", "sentence_ru": "Второе.",
+             "phrase_form": "next card"}
+
+
+@pytest.fixture
+def next_sentence(monkeypatch):
+    monkeypatch.setattr(sentences, "make_sentence", lambda *a, **k: dict(GOOD_SENT))
+
+
+def _tasks(conn):
+    return conn.execute("SELECT * FROM daily_tasks ORDER BY id").fetchall()
+
+
+async def test_chain_sends_next_repeat_after_answer(conn, fake_tts, next_sentence, monkeypatch):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall", morning=True)
+    nxt = _card(conn, "next card", interval=1, due=date(2026, 10, 4))
+    bot = FakeBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False) == "done"
+    assert len(bot.sent) == 2 and bot.sent[0][2].startswith("✅ Верно!")
+    assert bot.sent[0][3].get("reply_markup") is None          # кнопки «Ещё одно» больше нет
+    new = db.open_task(conn, U)
+    assert new["id"] != tid and new["card_id"] == nxt and new["is_new"] == 0
+    assert new["morning"] == 0 and new["sent_on"] == TODAY.isoformat()
+    assert new["requested"] == 0
+
+
+async def test_chain_task_is_never_stale_but_next_task_is(conn, fake_tts, next_sentence, monkeypatch):
+    """Round 1: «переспрос» через 15 минут — только для задач, явно запрошенных /next."""
+    from datetime import datetime, timedelta, timezone
+    t0 = datetime(2026, 10, 5, 10, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(daily, "_utcnow", lambda: t0)
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall")
+    _card(conn, "next card", interval=1, due=TODAY)
+    await daily.answer_task(FakeBot(), conn, None, EN, U, "a heads-up", TODAY, giveup=False)
+    chained = db.open_task(conn, U)
+    assert daily.is_stale(chained, t0 + timedelta(minutes=60)) is False
+    db.expire_task(conn, chained["id"])
+    _card(conn, "fresh", interval=0)
+    await daily.send_daily_task(FakeBot(), conn, None, EN, U, TODAY, random.Random(1),
+                                want_new=True)
+    requested = db.open_task(conn, U)
+    assert requested["requested"] == 1
+    assert daily.is_stale(requested, t0 + timedelta(minutes=15)) is True
+
+
+async def test_chain_after_last_repeat_gives_new_word_if_quota(conn, fake_tts, next_sentence):
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall")
+    nw = _card(conn, "next card")
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False)
+    new = db.open_task(conn, U)
+    assert len(bot.sent) == 2 and new["card_id"] == nw and new["is_new"] == 1
+
+
+async def test_chain_after_last_repeat_nothing_when_quota_exhausted(conn, fake_tts, next_sentence):
+    used = _card(conn, "used")
+    t = db.create_task(conn, user_id=U, card_id=used, kind="compose_hinted", sentence=None,
+                       sentence_ru=None, phrase_form=None, from_example=False,
+                       today=date(2026, 10, 4), morning=True, is_new=True)
+    db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall")
+    _card(conn, "next card")
+    bot = FakeBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False) == "done"
+    assert len(bot.sent) == 1 and db.open_task(conn, U) is None
+
+
+async def test_chain_after_giveup(conn, fake_tts, next_sentence):
+    cid = _card(conn, interval=7, due=TODAY)
+    _open(conn, cid, "listen")
+    nxt = _card(conn, "next card", interval=1, due=TODAY)
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "не помню", TODAY, giveup=True)
+    assert bot.sent[0][2].startswith("Ничего 🙂") and len(bot.sent) == 2
+    assert db.open_task(conn, U)["card_id"] == nxt
+
+
+async def test_chain_after_deleted_card(conn, fake_tts, next_sentence):
+    cid = _card(conn)
+    _open(conn, cid, "compose_hinted")
+    db.delete_card(conn, cid, user_id=U)
+    nxt = _card(conn, "next card", interval=1, due=TODAY)
+    bot = FakeBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False) == "done"
+    assert bot.sent[0][2] == daily.TEXT_CARD_DELETED and len(bot.sent) == 2
+    assert db.open_task(conn, U)["card_id"] == nxt
+
+
+async def test_no_chain_after_retry(conn, fake_tts, next_sentence, monkeypatch):
+    monkeypatch.setattr(sentences, "check_sentence", lambda *a, **k: pytest.fail("Gemini не нужен"))
+    cid = _card(conn)
+    tid = _open(conn, cid, "compose_hinted")
+    _card(conn, "next card", interval=1, due=TODAY)
+    bot = FakeBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, S, TODAY, giveup=False) == "retry"
+    assert [m[2] for m in bot.sent] == [daily.TEXT_COPIED_HINT]
+    assert [t["id"] for t in _tasks(conn)] == [tid]
+
+
+class _FailFirstBot(FakeBot):
+    """Первая отправка падает (результат), остальные проходят."""
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    async def _check(self, chat_id):
+        self.calls += 1
+        if self.calls == 1:
+            from aiogram.exceptions import TelegramNetworkError
+            raise TelegramNetworkError(method=None, message="timeout")
+
+
+async def test_no_chain_when_result_not_delivered(conn, fake_tts, next_sentence, monkeypatch):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall", sentence=None, phrase_form=None)
+    monkeypatch.setattr(daily.voice, "send_card_voice_to", _no_voice)
+    _card(conn, "next card", interval=1, due=TODAY)
+    bot = _FailFirstBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False) == "done"
+    assert bot.sent == [] and [t["id"] for t in _tasks(conn)] == [tid]
+    assert db.get_card(conn, cid)["interval_days"] == 7        # SRS засчитан
+
+
+async def _no_voice(*a, **k):
+    return None
+
+
+async def test_no_chain_when_deleted_notice_not_delivered(conn, fake_tts, next_sentence):
+    cid = _card(conn)
+    tid = _open(conn, cid, "compose_hinted")
+    db.delete_card(conn, cid, user_id=U)
+    _card(conn, "next card", interval=1, due=TODAY)
+    bot = _FailFirstBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False) == "done"
+    assert bot.sent == [] and [t["id"] for t in _tasks(conn)] == [tid]
+
+
+async def test_send_result_and_safe_send_return_bool(conn, fake_tts):
+    card = db.get_card(conn, _card(conn))
+    g = daily.Graded(True, "ok", None, None)
+    assert await daily._send_result(FakeBot(), conn, EN, U, card, g) is True
+    assert await daily._send_result(FakeBot(fail_for={U}), conn, EN, U, card, g) is False
+    assert await daily._safe_send(FakeBot(), U, "t") is True
+    assert await daily._safe_send(FakeBot(fail_for={U}), U, "t") is False
+
+
+async def test_chain_deliver_failure_keeps_done_and_logs(conn, fake_tts, next_sentence, monkeypatch, caplog):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    _card(conn, "next card", interval=1, due=TODAY)
+    from aiogram.exceptions import TelegramNetworkError
+
+    async def boom(*a, **k):
+        raise TelegramNetworkError(method=None, message="timeout")
+    monkeypatch.setattr(daily, "deliver", boom)
+    bot = FakeBot()
+    with caplog.at_level("WARNING", logger="daily"):
+        assert await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False) == "done"
+    assert len(bot.sent) == 1 and [t["id"] for t in _tasks(conn)] == [tid]
+    assert any("chain" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+async def test_chain_exception_is_logged_not_raised(conn, fake_tts, monkeypatch, caplog):
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall")
+
+    async def crash(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(daily, "_issue_locked", crash)
+    with caplog.at_level("WARNING", logger="daily"):
+        assert await daily.answer_task(FakeBot(), conn, None, EN, U, "a heads-up", TODAY,
+                                       giveup=False) == "done"
+    assert any("chain" in r.getMessage() for r in caplog.records)
+
+
+async def test_chain_takes_fresh_business_date(conn, fake_tts, next_sentence, monkeypatch):
+    """Ответ начат до полуночи — следующее задание выдаётся уже новым днём."""
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall")
+    nxt = _card(conn, "next card", interval=1, due=date(2026, 10, 6))   # due только «завтра»
+    after_midnight = date(2026, 10, 6)
+    monkeypatch.setattr(clock, "today", lambda: after_midnight)
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False)
+    new = db.open_task(conn, U)
+    assert new["card_id"] == nxt and new["sent_on"] == after_midnight.isoformat()
+
+
+async def test_race_answer_chain_and_morning_on_real_lock(conn, fake_tts, monkeypatch):
+    """Утро, пришедшее во время оценки, ждёт лок (вчерашнюю задачу не истекает, пропуск не
+    растёт); цепочка выдаёт следующее, утро видит его и ничего не выдаёт — одна новая задача."""
+    async def slow_to_thread(fn, *args, **kwargs):
+        await asyncio.sleep(0.02)
+        return fn(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", slow_to_thread)
+    monkeypatch.setattr(sentences, "check_sentence", lambda *a, **k: {**CHECK, "reply_sentence": None})
+    monkeypatch.setattr(sentences, "make_sentence", lambda *a, **k: {"sentence": "A second one.", "sentence_ru": "r",
+                                                                      "phrase_form": "second"})
+    cid = _card(conn)
+    tid = _open(conn, cid, "compose_hinted", today=date(2026, 10, 4))
+    second = _card(conn, word="second", example="A second one.", interval=1, due=TODAY)
+    bot = FakeBot()
+    answer = asyncio.create_task(daily.answer_task(bot, conn, None, EN, U, "x", TODAY, giveup=False))
+    await asyncio.sleep(0)   # answer_task успел взять лок и уйти в оценку
+    assert daily.user_lock(U).locked()
+    morning = asyncio.create_task(daily.send_daily_task(bot, conn, None, EN, U, TODAY,
+                                                        random.Random(1), morning=True))
+    res_answer, res_morning = await asyncio.wait_for(asyncio.gather(answer, morning), timeout=2)
+    assert res_answer == "done" and res_morning == "nothing"
+    assert db.get_task(conn, tid)["status"] == "answered"       # не expired
+    assert db.get_daily_state(conn, U)["missed_streak"] == 0
+    tasks = _tasks(conn)
+    assert len(tasks) == 2 and tasks[1]["card_id"] == second    # одна новая задача — от цепочки
+    assert len(bot.sent) == 2
+
+
+async def test_no_sixth_repeat_via_chain_when_cap_reached(conn, fake_tts, next_sentence):
+    """Round 2: пять повторов уже выдано сегодня — ответ на пятый шестой не цепляет."""
+    filler = _card(conn, "filler", interval=30, due=date(2026, 11, 1))
+    for _ in range(daily.MAX_REPEATS_PER_DAY - 1):
+        t = _open(conn, filler, "recall", morning=False)
+        db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall", morning=False)                 # пятый повтор дня
+    _card(conn, "next card", interval=1, due=TODAY)           # шестой — ждёт завтра
+    _card(conn, "new one")                                    # и новое в день долга не приходит
+    bot = FakeBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False) == "done"
+    assert len(bot.sent) == 1 and db.open_task(conn, U) is None
+    assert db.count_repeats_on(conn, U, TODAY) == daily.MAX_REPEATS_PER_DAY

@@ -25,7 +25,7 @@ router = Router()
 def bot_commands() -> list[BotCommand]:
     """Список для bot.set_my_commands (подсказка «/» в клиенте Telegram)."""
     return [
-        BotCommand(command="next", description="задание сейчас"),
+        BotCommand(command="next", description="новое слово"),
         BotCommand(command="add", description="добавить слово или фразу"),
         BotCommand(command="vocab", description="мой словарь"),
         BotCommand(command="cards", description="карточки"),

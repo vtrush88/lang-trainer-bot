@@ -1,5 +1,6 @@
 import pytest
 
+import clock
 import daily
 import db as db_module
 
@@ -20,3 +21,11 @@ def _fresh_locks():
     daily._locks.clear()
     yield
     daily._locks.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_clock():
+    """clock держит модульную зону; сбрасываем, чтобы порядок тестов не влиял."""
+    clock.configure(None)
+    yield
+    clock.configure(None)

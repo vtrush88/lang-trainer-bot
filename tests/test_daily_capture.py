@@ -8,8 +8,10 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import StateFilter
 
+import clock
 import daily
 import db
+import keyboards
 from handlers import add as add_handlers
 from handlers import daily as daily_handlers
 from languages import PROFILES
@@ -102,7 +104,8 @@ def _message(text, *, forwarded=False, user_id=U):
 
 
 def _today(monkeypatch, d=TODAY):
-    monkeypatch.setattr(daily_handlers, "date", SimpleNamespace(today=lambda: d))
+    """Бизнес-дата хендлеров — clock.today() (Task 3), не date.today()."""
+    monkeypatch.setattr(clock, "today", lambda: d)
 
 
 def _card(conn, word="x"):
@@ -113,52 +116,6 @@ def _card(conn, word="x"):
 def _task(conn, cid):
     return db.create_task(conn, user_id=U, card_id=cid, kind="compose", sentence=None, sentence_ru=None,
                           phrase_form=None, from_example=False, today=TODAY, morning=True)
-
-
-async def test_on_more_stale_date_answers_without_sending(conn, monkeypatch):
-    send = AsyncMock()
-    monkeypatch.setattr(daily, "send_daily_task", send)
-    _today(monkeypatch, date(2026, 10, 6))
-    call = _call("more:2026-10-05")
-    await daily_handlers.on_more(call, conn, None, EN)
-    send.assert_not_awaited()
-    assert call.message.answer.await_args.args[0] == daily.TEXT_MORE_STALE
-    call.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
-    call.answer.assert_awaited()
-
-
-async def test_on_more_passes_limit_and_reports_results(conn, monkeypatch):
-    for result, text in (("limit", daily.TEXT_MORE_LIMIT), ("nothing", daily.TEXT_MORE_EMPTY),
-                         ("failed", daily.TEXT_CAPTURE_FAILED)):
-        send = AsyncMock(return_value=result)
-        monkeypatch.setattr(daily, "send_daily_task", send)
-        _today(monkeypatch)
-        call = _call("more:2026-10-05")
-        await daily_handlers.on_more(call, conn, None, EN)
-        assert send.await_args.kwargs["limit"] == daily.MAX_TASKS_PER_DAY
-        assert send.await_args.kwargs["morning"] is False
-        assert call.message.answer.await_args.args[0] == text
-        call.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
-
-
-async def test_on_more_sent_is_silent_and_markup_errors_ignored(conn, monkeypatch):
-    monkeypatch.setattr(daily, "send_daily_task", AsyncMock(return_value="sent"))
-    _today(monkeypatch)
-    call = _call("more:2026-10-05")
-    call.message.edit_reply_markup = AsyncMock(side_effect=TelegramBadRequest(method=None, message="old"))
-    await daily_handlers.on_more(call, conn, None, EN)
-    call.message.answer.assert_not_awaited()
-    call.answer.assert_awaited()
-
-
-async def test_cmd_next_reports_nothing_and_failed(conn, monkeypatch):
-    for result, text in (("nothing", daily.TEXT_NOTHING_NEXT), ("failed", daily.TEXT_CAPTURE_FAILED)):
-        send = AsyncMock(return_value=result)
-        monkeypatch.setattr(daily, "send_daily_task", send)
-        message = _message("/next")
-        await daily_handlers.cmd_next(message, conn, None, EN)
-        assert send.await_args.kwargs["morning"] is False and send.await_args.args[4] == U
-        assert message.answer.await_args.args[0] == text
 
 
 async def test_on_clarify_answer_with_stale_task_refuses(conn, monkeypatch):
@@ -370,7 +327,7 @@ def test_all_daily_handlers_only_outside_modes_except_fallback():
     r = daily_handlers.router
     callbacks = {h.callback.__name__: h for h in r.callback_query.handlers}
     messages = {h.callback.__name__: h for h in r.message.handlers}
-    for name in ("on_more", "on_take_yes", "on_take_no", "on_clarify"):
+    for name in ("on_old_more", "on_take_yes", "on_take_no", "on_clarify"):
         assert _has_state_none(callbacks[name]), name
     for name in ("cmd_next", "on_free_text", "reject_non_text"):
         assert _has_state_none(messages[name]), name
@@ -445,18 +402,6 @@ async def test_second_quick_answer_during_grading_is_silently_ignored(conn, monk
     assert db.get_task(conn, tid)["status"] == "answered"
 
 
-async def test_on_more_answers_callback_before_long_work(conn, monkeypatch):
-    call = _call("more:2026-10-05")
-
-    async def send(*a, **k):
-        call.answer.assert_awaited_once_with()   # «крутилка» снята ДО Gemini/TTS
-        return "sent"
-    monkeypatch.setattr(daily, "send_daily_task", send)
-    _today(monkeypatch)
-    await daily_handlers.on_more(call, conn, None, EN)
-    call.answer.assert_awaited_once_with()
-
-
 async def test_on_clarify_answers_callback_before_long_work(conn, monkeypatch):
     live = _task(conn, _card(conn))
     call = _call("clarify:answer:4")
@@ -526,7 +471,7 @@ PROMO = "Our new release ships faster builds and better caching for everyone"
 def _next_task(conn, cid, *, phrase_form=None, issued_at=None):
     return db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence="S", sentence_ru="r",
                           phrase_form=phrase_form, from_example=False, today=TODAY, morning=False,
-                          issued_at=issued_at)
+                          issued_at=issued_at, requested=True)   # выдано по /next
 
 
 def _assert_clarified(message, state, answer, text, tid):
@@ -640,3 +585,113 @@ async def test_on_clarify_retry_answer_sends_nothing_extra(conn, monkeypatch):
     await daily_handlers.on_clarify(call, _state({"pending": {"4": {"text": "ответ", "task_id": live}}}),
                                     conn, None, EN)
     call.message.answer.assert_not_awaited()
+
+
+# ---- Task 3: /next = новое слово, кнопки «Ещё одно» нет ----
+
+@pytest.mark.parametrize("result,text", [
+    ("tomorrow", daily.TEXT_NEXT_TOMORROW),
+    ("nothing", daily.TEXT_NO_NEW_WORDS),
+    ("failed", daily.TEXT_NEXT_FAILED),
+])
+async def test_cmd_next_asks_for_new_word_and_maps_results(conn, monkeypatch, result, text):
+    send = AsyncMock(return_value=result)
+    monkeypatch.setattr(daily, "send_daily_task", send)
+    _today(monkeypatch)
+    message = _message("/next")
+    await daily_handlers.cmd_next(message, conn, None, EN)
+    assert send.await_args.kwargs["want_new"] is True
+    assert send.await_args.kwargs.get("morning", False) is False
+    assert send.await_args.args[4] == U and send.await_args.args[5] == TODAY
+    assert message.answer.await_args.args[0] == text
+
+
+@pytest.mark.parametrize("result", ["sent", "resent"])
+async def test_cmd_next_sent_or_resent_is_silent(conn, monkeypatch, result):
+    monkeypatch.setattr(daily, "send_daily_task", AsyncMock(return_value=result))
+    message = _message("/next")
+    await daily_handlers.cmd_next(message, conn, None, EN)
+    message.answer.assert_not_awaited()
+
+
+async def test_cmd_next_later_says_when(conn, monkeypatch):
+    monkeypatch.setattr(daily, "send_daily_task", AsyncMock(return_value="later"))
+    cid = _card(conn)
+    t = db.create_task(conn, user_id=U, card_id=cid, kind="compose_hinted", sentence=None,
+                       sentence_ru=None, phrase_form=None, from_example=False,
+                       today=TODAY, morning=True, is_new=True)   # пн: новое уже было
+    db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    _today(monkeypatch, date(2026, 10, 6))                           # вт → через 2 дня
+    message = _message("/next")
+    await daily_handlers.cmd_next(message, conn, None, EN)
+    assert message.answer.await_args.args[0] == daily.TEXT_NEXT_LATER.format(when="через 2 дня")
+
+
+def test_more_button_is_gone():
+    assert not hasattr(daily_handlers, "on_more") and not hasattr(daily_handlers, "_rng")
+    assert not hasattr(keyboards, "more_keyboard")
+    for name in ("MAX_TASKS_PER_DAY", "more_button_allowed", "TEXT_MORE_STALE",
+                 "TEXT_MORE_LIMIT", "TEXT_MORE_EMPTY", "TEXT_NOTHING_NEXT"):
+        assert not hasattr(daily, name), name
+    assert not hasattr(db, "pick_due_card")
+
+
+async def test_inside_mode_fallback_still_covers_old_more_buttons(conn):
+    """Round 1: старая «Ещё одно», нажатая внутри режима, тоже не оставляет «крутилку»."""
+    r = daily_handlers.router
+    last = r.callback_query.handlers[-1]
+    assert last.callback is daily_handlers.daily_button_inside_mode
+    import inspect
+    assert '("more:", "take:", "clarify:")' in inspect.getsource(daily_handlers)
+
+
+async def test_take_yes_uses_business_date(conn, monkeypatch):
+    _today(monkeypatch, date(2026, 10, 9))
+    state = _state({"pending": {"1": dict(ITEM)}})
+    await daily_handlers.on_take_yes(_call("take:yes:1"), state, conn, EN)
+    row = conn.execute("SELECT created_at FROM cards WHERE word = ?", (ITEM["word"],)).fetchone()
+    assert row["created_at"] == "2026-10-09"
+
+
+async def test_old_more_button_outside_mode_says_not_needed_and_issues_nothing(conn, monkeypatch):
+    """Round 1: старые «Ещё одно» в чате — снять кнопку, нейтральный текст, задание не выдаём."""
+    send = AsyncMock()
+    monkeypatch.setattr(daily, "send_daily_task", send)
+    call = _call("more:2026-10-05")
+    await daily_handlers.on_old_more(call)
+    call.message.edit_reply_markup.assert_awaited_once_with(reply_markup=None)
+    call.answer.assert_awaited_once_with(daily.TEXT_MORE_GONE)
+    assert daily.TEXT_MORE_GONE == "Эта кнопка больше не нужна — задания теперь приходят сами 🙂"
+    send.assert_not_awaited()
+    assert _has_state_none(next(h for h in daily_handlers.router.callback_query.handlers
+                                if h.callback is daily_handlers.on_old_more))
+
+
+async def test_old_more_answers_callback_first_and_survives_network_error(conn):
+    """Round 2: «крутилка» снимается ДО правки разметки; сетевой сбой правки не падает."""
+    from aiogram.exceptions import TelegramNetworkError
+    call = _call("more:2026-10-05")
+    order = []
+    call.answer = AsyncMock(side_effect=lambda *a, **k: order.append("answer"))
+
+    async def edit(**kw):
+        order.append("edit")
+        raise TelegramNetworkError(method=None, message="timeout")
+    call.message.edit_reply_markup = AsyncMock(side_effect=edit)
+    await daily_handlers.on_old_more(call)
+    assert order == ["answer", "edit"]
+
+
+async def test_cmd_next_tomorrow_with_quota_exhausted_says_real_when(conn, monkeypatch):
+    """Финальная волна: «придёт завтра» не обещаем, если норма/интервал пустят позже."""
+    monkeypatch.setattr(daily, "send_daily_task", AsyncMock(return_value="tomorrow"))
+    cid = _card(conn)
+    t = db.create_task(conn, user_id=U, card_id=cid, kind="compose_hinted", sentence=None,
+                       sentence_ru=None, phrase_form=None, from_example=False,
+                       today=TODAY, morning=True, is_new=True)   # пн: новое уже было
+    db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    _today(monkeypatch, date(2026, 10, 6))                           # вт → через 2 дня
+    message = _message("/next")
+    await daily_handlers.cmd_next(message, conn, None, EN)
+    assert message.answer.await_args.args[0] == "Сохранённое сегодня придёт через 2 дня 🙂"
+    assert daily.TEXT_NEXT_SAVED_WHEN.format(when="через 2 дня") == message.answer.await_args.args[0]

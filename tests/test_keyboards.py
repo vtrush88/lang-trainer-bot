@@ -57,15 +57,6 @@ def test_card_detail_keyboard_carries_id_and_page():
     assert datas == {"del:5:2", "vocab:2"}
 
 
-from datetime import date
-
-
-def test_more_keyboard_carries_date():
-    kb = keyboards.more_keyboard(date(2026, 10, 5))
-    btn = kb.inline_keyboard[0][0]
-    assert btn.callback_data == "more:2026-10-05" and "Ещё" in btn.text
-
-
 def test_take_and_clarify_keyboards_carry_seq():
     take = keyboards.take_keyboard(7).inline_keyboard[0]
     assert [b.callback_data for b in take] == ["take:yes:7", "take:no:7"]

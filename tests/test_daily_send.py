@@ -8,6 +8,7 @@ import pytest
 from aiogram.exceptions import (TelegramForbiddenError, TelegramRetryAfter,
                                 TelegramServerError)
 
+import clock
 import daily
 import db
 from languages import PROFILES
@@ -53,6 +54,12 @@ def fake_tts(monkeypatch):
 def fake_llm(monkeypatch):
     monkeypatch.setattr(sentences, "make_sentence", lambda llm, p, card, kind, avoid: dict(GOOD))
     return SimpleNamespace()
+
+
+def _tasks_on(conn, day):
+    """Все задачи пользователя за день (в проде счётчика нет — только повторы/новые)."""
+    return conn.execute("SELECT COUNT(*) AS n FROM daily_tasks WHERE user_id = ? AND sent_on = ?",
+                        (U, day.isoformat())).fetchone()["n"]
 
 
 def _card(conn, word="a heads-up", *, created=date(2026, 10, 1), interval=0,
@@ -116,20 +123,6 @@ async def test_morning_keeps_task_issued_today_by_next(conn, fake_llm, fake_tts)
     assert out == "nothing" and bot.sent == []
     assert db.get_task(conn, tid)["status"] == "open"
     assert db.get_daily_state(conn, U)["missed_streak"] == 0
-
-
-async def test_limit_wins_over_resend(conn, fake_llm, fake_tts):
-    cid = _card(conn)
-    for _ in range(2):
-        t = db.create_task(conn, user_id=U, card_id=cid, kind="compose", sentence=None, sentence_ru=None,
-                           phrase_form=None, from_example=False, today=TODAY, morning=False)
-        db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
-    db.create_task(conn, user_id=U, card_id=cid, kind="compose", sentence=None, sentence_ru=None,
-                   phrase_form=None, from_example=False, today=TODAY, morning=False)   # третья, открыта
-    bot = FakeBot()
-    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
-                                      morning=False, limit=daily.MAX_TASKS_PER_DAY)
-    assert out == "limit" and bot.sent == []
 
 
 async def test_expired_non_morning_task_does_not_bump(conn, fake_llm, fake_tts):
@@ -250,7 +243,7 @@ async def test_next_resends_open_task_without_new_generation(conn, fake_llm, fak
     monkeypatch.setattr(sentences, "make_sentence", lambda *a, **k: calls.append(1) or dict(GOOD))
     out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1), morning=False)
     assert out == "resent" and calls == [] and len(bot.sent) == 2
-    assert db.count_tasks_on(conn, U, TODAY) == 1
+    assert _tasks_on(conn, TODAY) == 1
     assert db.get_daily_state(conn, U)["last_sent_on"] is None   # цепочка/next не трогают
 
 
@@ -268,7 +261,7 @@ async def test_concurrent_next_yields_one_sent_one_resent(conn, fake_tts, monkey
         daily.send_daily_task(bot, conn, None, EN, U, TODAY, rng, morning=False),
         daily.send_daily_task(bot, conn, None, EN, U, TODAY, rng, morning=False))
     assert sorted(results) == ["resent", "sent"]
-    assert db.count_tasks_on(conn, U, TODAY) == 1
+    assert _tasks_on(conn, TODAY) == 1
 
 
 async def test_resend_listen_with_tts_failure_falls_to_text(conn, fake_llm, fake_tts, monkeypatch):
@@ -283,21 +276,6 @@ async def test_resend_listen_with_tts_failure_falls_to_text(conn, fake_llm, fake
     out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1), morning=False)
     assert out == "resent" and bot.sent[-1][0] == "message" and "___" in bot.sent[-1][2]
     assert db.open_task(conn, U)["kind"] == "gap"   # вид в БД = то, что увидел пользователь
-
-
-async def test_limit_is_checked_inside_lock(conn, fake_llm, fake_tts):
-    cid = _card(conn)
-    _card(conn, word="second", example="Second one here.")
-    for _ in range(3):
-        t = db.create_task(conn, user_id=U, card_id=cid, kind="compose", sentence=None, sentence_ru=None,
-                           phrase_form=None, from_example=False, today=TODAY, morning=False)
-        db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
-    bot = FakeBot()
-    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
-                                      morning=False, limit=daily.MAX_TASKS_PER_DAY)
-    assert out == "limit" and bot.sent == []
-    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1), morning=False)
-    assert out == "sent"   # /next без лимита
 
 
 async def test_synthesize_tmp_names_are_unique(fake_tts):
@@ -326,6 +304,7 @@ async def test_daily_loop_uses_configured_tz_date_and_absolute_delay(monkeypatch
     monkeypatch.setattr(daily, "run_morning", fake_run)
     cfg = SimpleNamespace(daily_tz="Pacific/Kiritimati", daily_at=time(9, 0),
                           allowed_user_ids={1, 2, 3}, daily_exclude_ids={2})
+    clock.configure(cfg.daily_tz)   # единственный владелец зоны — bot.main (Task 3)
     with pytest.raises(asyncio.CancelledError):
         await daily.daily_loop(None, None, None, EN, cfg)
     from datetime import datetime
@@ -380,20 +359,8 @@ T0 = datetime(2026, 10, 5, 10, 0, tzinfo=timezone.utc)
 def _open_next_task(conn, cid, *, minutes_ago, morning=False):
     return db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence=GOOD["sentence"],
                           sentence_ru="r", phrase_form="a heads-up", from_example=False, today=TODAY,
-                          morning=morning, issued_at=T0 - timedelta(minutes=minutes_ago))
-
-
-async def test_next_with_stale_task_expires_it_and_sends_new(conn, fake_llm, fake_tts, monkeypatch):
-    monkeypatch.setattr(daily, "_utcnow", lambda: T0)
-    cid = _card(conn)
-    old = _open_next_task(conn, cid, minutes_ago=15)
-    bot = FakeBot()
-    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1), morning=False)
-    assert out == "sent"
-    assert db.get_task(conn, old)["status"] == "expired"
-    new = db.open_task(conn, U)
-    assert new["id"] != old and new["issued_at"] == T0.isoformat()
-    assert db.get_daily_state(conn, U)["missed_streak"] == 0
+                          morning=morning, issued_at=T0 - timedelta(minutes=minutes_ago),
+                          requested=True)
 
 
 async def test_next_with_fresh_task_resends(conn, fake_llm, fake_tts, monkeypatch):
@@ -414,13 +381,311 @@ async def test_next_with_old_morning_task_resends(conn, fake_llm, fake_tts, monk
     assert out == "resent" and db.get_task(conn, tid)["status"] == "open"
 
 
-async def test_limit_still_wins_over_stale(conn, fake_llm, fake_tts, monkeypatch):
+
+async def test_daily_loop_does_not_configure_clock_itself(monkeypatch):
+    """Зона — у bot.main (единственный владелец); цикл только читает clock."""
+    from datetime import time
+    calls = []
+    monkeypatch.setattr(clock, "configure", lambda tz: calls.append(tz))
+
+    async def stop(d):
+        raise asyncio.CancelledError
+    monkeypatch.setattr(daily.asyncio, "sleep", stop)
+    cfg = SimpleNamespace(daily_tz="Pacific/Kiritimati", daily_at=time(9, 0),
+                          allowed_user_ids={1}, daily_exclude_ids=set())
+    with pytest.raises(asyncio.CancelledError):
+        await daily.daily_loop(None, None, None, EN, cfg)
+    assert calls == []
+
+
+async def test_next_with_stale_task_resends_and_touches_issued_at(conn, fake_llm, fake_tts, monkeypatch):
+    """/next при открытой задаче только повторяет её: не истекает, issued_at = сейчас
+    (иначе ответ сразу после /next уйдёт в 15-минутный «переспрос»)."""
     monkeypatch.setattr(daily, "_utcnow", lambda: T0)
     cid = _card(conn)
-    for _ in range(2):
-        t = _open_next_task(conn, cid, minutes_ago=60)
-        db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
-    stale = _open_next_task(conn, cid, minutes_ago=60)
+    old = _open_next_task(conn, cid, minutes_ago=60)
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "resent" and len(bot.sent) == 1
+    task = db.get_task(conn, old)
+    assert task["status"] == "open" and task["issued_at"] == T0.isoformat()
+    assert daily.is_stale(task, T0) is False          # stale-текст после повтора не переспрашивает
+    assert _tasks_on(conn, TODAY) == 1
+
+
+# ---- Task 3: расписание — повторы первыми, новые по недельной норме ----
+
+def _new_task(conn, cid, day, *, status="answered"):
+    """Задача-«новое слово» (is_new=1), выданная в day; по умолчанию уже закрыта."""
+    tid = db.create_task(conn, user_id=U, card_id=cid, kind="compose_hinted", sentence=None,
+                         sentence_ru=None, phrase_form=None, from_example=False, today=day,
+                         morning=True, is_new=True)
+    if status == "answered":
+        db.claim_task(conn, tid); db.finish_task(conn, tid, ok=True)
+    elif status == "expired":
+        db.expire_task(conn, tid)
+    return tid
+
+
+def _close_open(conn, *, next_due=date(2026, 11, 1)):
+    """Ответить на открытую задачу «вручную»: закрыть и увести карточку в будущее."""
+    t = db.open_task(conn, U)
+    db.claim_task(conn, t["id"]); db.finish_task(conn, t["id"], ok=True)
+    db.update_review(conn, t["card_id"], interval_days=30, due_at=next_due, remembered=True)
+    return t
+
+
+async def test_morning_repeat_comes_before_new(conn, fake_llm, fake_tts):
+    _card(conn, "fresh new")                                         # новая, свежая
+    rep = _card(conn, "old repeat", interval=3, due=date(2026, 10, 3))
     out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
-                                      morning=False, limit=daily.MAX_TASKS_PER_DAY)
-    assert out == "limit" and db.get_task(conn, stale)["status"] == "open"
+                                      morning=True)
+    task = db.open_task(conn, U)
+    assert out == "sent" and task["card_id"] == rep and task["is_new"] == 0
+    assert task["requested"] == 0
+
+
+async def test_morning_new_word_when_no_repeats_and_quota_allows(conn, fake_llm, fake_tts):
+    cid = _card(conn)
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      morning=True)
+    task = db.open_task(conn, U)
+    assert out == "sent" and task["card_id"] == cid and task["is_new"] == 1
+
+
+async def test_morning_quota_exhausted_is_nothing(conn, fake_llm, fake_tts):
+    a, b = _card(conn, "a"), _card(conn, "b")
+    _card(conn, "c")
+    monday = date(2026, 10, 5)
+    _new_task(conn, a, monday)
+    _new_task(conn, b, date(2026, 10, 8))
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, date(2026, 10, 11),
+                                      random.Random(1), morning=True)
+    assert out == "nothing" and bot.sent == []
+
+
+async def test_new_word_gap_rule_across_iso_week_boundary(conn, fake_llm, fake_tts):
+    """Прошлая неделя в норму не идёт, но интервал 3 дня — сквозной."""
+    a, b = _card(conn, "a"), _card(conn, "b")
+    c = _card(conn, "c")
+    _new_task(conn, a, date(2026, 10, 1))   # чт прошлой недели
+    _new_task(conn, b, date(2026, 10, 4))   # вс прошлой недели
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, date(2026, 10, 5),
+                                      random.Random(1), morning=True)
+    assert out == "nothing"                 # пн: с воскресенья прошёл 1 день
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, date(2026, 10, 7),
+                                      random.Random(1), morning=True)
+    assert out == "sent" and db.open_task(conn, U)["card_id"] == c
+
+
+async def test_reissued_unanswered_new_card_does_not_eat_second_slot(conn, fake_llm, fake_tts):
+    a = _card(conn, "a")
+    b = _card(conn, "b", created=date(2026, 9, 1))
+    _new_task(conn, a, date(2026, 10, 5), status="expired")   # пн: выдана, не отвечена
+    _new_task(conn, a, date(2026, 10, 8))                     # чт: та же карточка повторно
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, date(2026, 10, 11),
+                                      random.Random(1), morning=True)
+    task = db.open_task(conn, U)
+    assert out == "sent" and task["card_id"] == b and task["is_new"] == 1
+
+
+async def test_six_repeats_due_five_today_sixth_tomorrow_no_new_on_debt_day(conn, fake_llm, fake_tts):
+    reps = [_card(conn, f"rep {i}", interval=3, due=date(2026, 9, 20 + i)) for i in range(6)]
+    _card(conn, "new word")                  # новое доступно, но в день долга не приходит
+    bot = FakeBot()
+    issued = []
+    for _ in range(5):
+        out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1))
+        assert out == "sent"
+        issued.append(_close_open(conn)["card_id"])
+    assert issued == reps[:5]                # самые просроченные первыми
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1))
+    assert out == "nothing" and len(bot.sent) == 5
+    assert db.count_new_on(conn, U, TODAY) == 0
+    tomorrow = date(2026, 10, 6)
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, tomorrow, random.Random(1),
+                                      morning=True)
+    task = db.open_task(conn, U)
+    assert out == "sent" and task["card_id"] == reps[5] and task["is_new"] == 0
+
+
+async def test_repeat_cap_counts_only_todays_repeats(conn, fake_llm, fake_tts):
+    """MAX_REPEATS_PER_DAY: вчерашние повторы и сегодняшние новые не считаются."""
+    old = _card(conn, "old", interval=3, due=date(2026, 9, 1))
+    for _ in range(daily.MAX_REPEATS_PER_DAY):
+        t = db.create_task(conn, user_id=U, card_id=old, kind="recall", sentence=None,
+                           sentence_ru=None, phrase_form=None, from_example=False,
+                           today=date(2026, 10, 4), morning=False)
+        db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+    nw = _card(conn, "nw")
+    _new_task(conn, nw, TODAY)
+    rep = _card(conn, "due today", interval=1, due=TODAY)
+    db.update_review(conn, old, interval_days=30, due_at=date(2026, 11, 1), remembered=True)
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1))
+    assert out == "sent" and db.open_task(conn, U)["card_id"] == rep
+
+
+async def test_morning_yesterday_open_task_expires_bumps_and_issues_repeat(conn, fake_llm, fake_tts):
+    cid = _card(conn, "yesterday", interval=1, due=date(2026, 10, 4))
+    old = db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence="S", sentence_ru="r",
+                         phrase_form="yesterday", from_example=False,
+                         today=date(2026, 10, 4), morning=True)
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      morning=True)
+    assert out == "sent" and len(bot.sent) == 1
+    assert db.get_task(conn, old)["status"] == "expired"
+    assert db.get_daily_state(conn, U)["missed_streak"] == 1
+    task = db.open_task(conn, U)
+    assert task["id"] != old and task["card_id"] == cid and task["is_new"] == 0
+    assert db.get_daily_state(conn, U)["last_sent_on"] == TODAY.isoformat()
+
+
+async def test_next_gives_new_word_even_with_repeats_due(conn, fake_llm, fake_tts):
+    _card(conn, "rep", interval=3, due=date(2026, 10, 1))
+    nw = _card(conn, "nw")
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    task = db.open_task(conn, U)
+    assert out == "sent" and task["card_id"] == nw and task["is_new"] == 1 and task["morning"] == 0
+    assert task["requested"] == 1                                # только /next ставит requested
+    assert db.get_daily_state(conn, U)["last_sent_on"] is None   # set_last_sent — только утром
+
+
+async def test_next_quota_exhausted_is_later(conn, fake_llm, fake_tts):
+    a = _card(conn, "a")
+    _card(conn, "b")
+    _new_task(conn, a, date(2026, 10, 4))
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "later" and bot.sent == []
+
+
+async def test_next_one_new_per_day(conn, fake_llm, fake_tts):
+    a = _card(conn, "a")
+    _card(conn, "b")
+    _new_task(conn, a, TODAY)
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "later"
+
+
+async def test_next_availability_before_quota(conn, fake_llm, fake_tts):
+    """Round 1: сначала наличие карточек, потом норма. Норма исчерпана, но новых нет →
+    "nothing"; есть только сохранённые сегодня → "tomorrow"; есть доступная → "later"."""
+    used = _card(conn, "used")
+    _new_task(conn, used, TODAY)                 # норма дня/интервала исчерпана
+    db.update_review(conn, used, interval_days=1, due_at=date(2026, 11, 1), remembered=True)
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "nothing"
+    _card(conn, "saved today", created=TODAY)
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "tomorrow"
+    _card(conn, "available")
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "later" and bot.sent == []
+
+
+async def test_next_saved_today_is_tomorrow_and_empty_is_nothing(conn, fake_llm, fake_tts):
+    bot = FakeBot()
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "nothing"
+    _card(conn, "saved today", created=TODAY)
+    out = await daily.send_daily_task(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "tomorrow" and bot.sent == []
+
+
+async def test_next_with_open_task_of_deleted_card_expires_and_continues(conn, fake_llm, fake_tts):
+    gone = _card(conn, "gone", interval=1, due=TODAY)
+    tid = db.create_task(conn, user_id=U, card_id=gone, kind="gap", sentence="S", sentence_ru="r",
+                         phrase_form="gone", from_example=False, today=TODAY, morning=True)
+    db.delete_card(conn, gone, user_id=U)
+    nw = _card(conn, "nw")
+    out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                      want_new=True)
+    assert out == "sent"
+    assert db.get_task(conn, tid)["status"] == "expired"
+    assert db.open_task(conn, U)["card_id"] == nw
+
+
+async def test_issue_locked_chain_with_open_task_is_nothing(conn, fake_llm, fake_tts):
+    cid = _card(conn, "rep", interval=1, due=TODAY)
+    tid = db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence="S", sentence_ru="r",
+                         phrase_form="rep", from_example=False, today=TODAY, morning=False)
+    bot = FakeBot()
+    out = await daily._issue_locked(bot, conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                    morning=False, want_new=False, chain=True)
+    assert out == "nothing" and bot.sent == [] and db.get_task(conn, tid)["status"] == "open"
+
+
+async def test_send_daily_task_rng_defaults_to_module_rng(conn, fake_llm, fake_tts, monkeypatch):
+    seen = []
+    monkeypatch.setattr(daily, "task_kind", lambda interval, rng: seen.append(rng) or "compose")
+    monkeypatch.setattr(daily, "rng", random.Random(7))
+    _card(conn, "rep", interval=40, due=TODAY)
+    await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY)
+    assert seen == [daily.rng]
+
+
+# ---- финальная волна: причина каждого "nothing" — в логе ----
+
+def _nothing_reasons(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.levelname == "INFO" and "nothing" in r.getMessage() and str(U) in r.getMessage()]
+
+
+async def test_nothing_reason_logged_open_today_and_chain_guard(conn, fake_llm, fake_tts, caplog):
+    cid = _card(conn)
+    db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence="S", sentence_ru="r",
+                   phrase_form="a heads-up", from_example=False, today=TODAY, morning=False)
+    with caplog.at_level("INFO", logger="daily"):
+        await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, morning=True)
+        await daily._issue_locked(FakeBot(), conn, fake_llm, EN, U, TODAY, random.Random(1),
+                                  morning=False, want_new=False, chain=True)
+    reasons = _nothing_reasons(caplog)
+    assert any("open task from today" in m for m in reasons)
+    assert any("chain guard" in m for m in reasons)
+
+
+async def test_nothing_reason_logged_quiet_after_expiry(conn, fake_llm, fake_tts, caplog):
+    cid = _card(conn)
+    db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence="S", sentence_ru="r",
+                   phrase_form="a heads-up", from_example=False, today=date(2026, 10, 4),
+                   morning=True)
+    for _ in range(2):
+        db.bump_missed(conn, U)
+    db.set_last_sent(conn, U, date(2026, 10, 4))
+    with caplog.at_level("INFO", logger="daily"):
+        out = await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY, morning=True)
+    assert out == "nothing"
+    assert any("quiet mode" in m and "expired" in m for m in _nothing_reasons(caplog))
+
+
+async def test_nothing_reason_logged_cap_quota_and_empty(conn, fake_llm, fake_tts, caplog):
+    with caplog.at_level("INFO", logger="daily"):
+        await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY)       # пусто
+        a = _card(conn, "a")
+        _new_task(conn, a, TODAY)
+        _card(conn, "b")
+        await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY)       # норма
+        rep = _card(conn, "rep", interval=1, due=TODAY)
+        for _ in range(daily.MAX_REPEATS_PER_DAY):
+            t = db.create_task(conn, user_id=U, card_id=rep, kind="recall", sentence=None,
+                               sentence_ru=None, phrase_form=None, from_example=False,
+                               today=TODAY, morning=False)
+            db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
+        await daily.send_daily_task(FakeBot(), conn, fake_llm, EN, U, TODAY)       # потолок
+    reasons = " | ".join(_nothing_reasons(caplog))
+    assert "no due repeat and no new card" in reasons
+    assert "new-word quota or 3-day gap" in reasons
+    assert "repeat cap reached" in reasons

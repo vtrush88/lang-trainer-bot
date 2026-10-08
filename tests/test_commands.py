@@ -125,14 +125,16 @@ async def test_next_leaves_modes_then_sends_task(conn, monkeypatch):
     state = FakeState(AddCard.waiting_for_text.state, {"pending": {"1": {"word": "x"}}})
     seen = {}
 
-    async def fake_send(bot, conn_, llm, profile, user_id, today, rng, *, morning):
+    async def fake_send(bot, conn_, llm, profile, user_id, today, rng=None, *, morning=False,
+                        want_new=False):
         seen.update(state=state.state, pending=state.data.get("pending"), user_id=user_id,
-                    profile=profile, morning=morning)
+                    profile=profile, morning=morning, want_new=want_new)
         return "sent"
     monkeypatch.setattr(daily, "send_daily_task", fake_send)
     message = _message("/next")
     await commands.cmd_next(message, state, conn, "llm", EN)
-    assert seen == {"state": None, "pending": {}, "user_id": U, "profile": EN, "morning": False}
+    assert seen == {"state": None, "pending": {}, "user_id": U, "profile": EN, "morning": False,
+                    "want_new": True}
     message.answer.assert_not_awaited()
 
 
@@ -140,6 +142,10 @@ def test_bot_commands_list():
     cmds = commands.bot_commands()
     assert [c.command for c in cmds] == ["next", "add", "vocab", "cards", "check", "listen"]
     assert all(c.description for c in cmds)
+
+
+def test_next_command_description_is_new_word():
+    assert {c.command: c.description for c in commands.bot_commands()}["next"] == "новое слово"
 
 
 def test_command_handlers_have_no_state_filter():

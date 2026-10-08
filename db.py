@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS daily_tasks (
     morning        INTEGER NOT NULL DEFAULT 0,
     status         TEXT NOT NULL DEFAULT 'open',
     answered_ok    INTEGER,
-    issued_at      TEXT
+    issued_at      TEXT,
+    is_new         INTEGER NOT NULL DEFAULT 0,
+    requested      INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS daily_tasks_one_open
     ON daily_tasks(user_id) WHERE status = 'open';
@@ -79,6 +81,8 @@ def connect(path: str) -> sqlite3.Connection:
 _ADDED_COLUMNS = (
     ("cards", "context", "TEXT"),
     ("daily_tasks", "issued_at", "TEXT"),   # ISO UTC; NULL у старых строк = «не stale»
+    ("daily_tasks", "is_new", "INTEGER NOT NULL DEFAULT 0"),  # 1 = первое задание слова
+    ("daily_tasks", "requested", "INTEGER NOT NULL DEFAULT 0"),  # 1 = выдано по явному /next
 )
 
 
@@ -99,6 +103,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_column_names(conn)
     _add_missing_columns(conn)
     conn.executescript(SCHEMA)
+    # Backfill на КАЖДОМ старте (идемпотентно): закрывает «ALTER прошёл, UPDATE не успел».
+    # compose_hinted выдаётся только на нулевой ступени → признак точный.
+    conn.execute("UPDATE daily_tasks SET is_new = 1"
+                 " WHERE kind = 'compose_hinted' AND is_new = 0")
     conn.commit()
 
 
@@ -243,18 +251,20 @@ def create_task(
     conn: sqlite3.Connection, *, user_id: int, card_id: int, kind: str,
     sentence: str | None, sentence_ru: str | None, phrase_form: str | None,
     from_example: bool, today: date, morning: bool,
-    issued_at: datetime | None = None,
+    issued_at: datetime | None = None, is_new: bool = False, requested: bool = False,
 ) -> int:
     """issued_at — момент выдачи (aware UTC); по умолчанию сейчас. Пишется ISO-строкой."""
     stamp = (issued_at or datetime.now(timezone.utc)).isoformat()
     cur = conn.execute(
         """
         INSERT INTO daily_tasks (user_id, card_id, kind, sentence, sentence_ru,
-                                 phrase_form, from_example, sent_on, morning, issued_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 phrase_form, from_example, sent_on, morning, issued_at,
+                                 is_new, requested)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (user_id, card_id, kind, sentence, sentence_ru, phrase_form,
-         int(from_example), today.isoformat(), int(morning), stamp),
+         int(from_example), today.isoformat(), int(morning), stamp, int(is_new),
+         int(requested)),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -331,23 +341,66 @@ def release_stale_grading(conn: sqlite3.Connection) -> int:
     return cur.rowcount
 
 
-def pick_due_card(conn: sqlite3.Connection, user_id: int, today: date) -> sqlite3.Row | None:
-    """Карточка для задания: новые первыми (тёплый контекст), потом самая просроченная.
+_ENRICHED = "enriched = 1 AND translation IS NOT NULL AND translation != ''"
 
-    Только обогащённые с переводом и созданные ДО сегодня («придёт завтра утром»).
-    """
-    iso = today.isoformat()
+
+def pick_due_repeat(conn: sqlite3.Connection, user_id: int, today: date) -> sqlite3.Row | None:
+    """Самый просроченный повтор (interval_days > 0, due_at <= today); tie → по id."""
     return conn.execute(
-        """
-        SELECT * FROM cards
-        WHERE user_id = ? AND due_at <= ? AND enriched = 1
-          AND translation IS NOT NULL AND translation != ''
-          AND created_at < ?
-        ORDER BY (interval_days = 0) DESC, due_at, id
-        LIMIT 1
-        """,
-        (user_id, iso, iso),
+        f"SELECT * FROM cards WHERE user_id = ? AND interval_days > 0 AND due_at <= ?"
+        f" AND {_ENRICHED} ORDER BY due_at, id LIMIT 1",
+        (user_id, today.isoformat()),
     ).fetchone()
+
+
+def pick_new_card(conn: sqlite3.Connection, user_id: int, today: date) -> sqlite3.Row | None:
+    """Новое слово: сначала ни разу не показанные, потом показанные-неотвеченные; свежие первыми."""
+    return conn.execute(
+        f"SELECT * FROM cards WHERE user_id = ? AND interval_days = 0"
+        f" AND {_ENRICHED} AND created_at < ?"
+        f" ORDER BY (EXISTS(SELECT 1 FROM daily_tasks t WHERE t.card_id = cards.id)), id DESC"
+        f" LIMIT 1",
+        (user_id, today.isoformat()),
+    ).fetchone()
+
+
+def has_new_cards_created_on(conn: sqlite3.Connection, user_id: int, today: date) -> bool:
+    return conn.execute(
+        f"SELECT 1 FROM cards WHERE user_id = ? AND interval_days = 0 AND created_at = ?"
+        f" AND {_ENRICHED} LIMIT 1", (user_id, today.isoformat())).fetchone() is not None
+
+
+def count_repeats_on(conn: sqlite3.Connection, user_id: int, today: date) -> int:
+    return int(conn.execute(
+        "SELECT COUNT(*) AS n FROM daily_tasks WHERE user_id = ? AND sent_on = ? AND is_new = 0",
+        (user_id, today.isoformat())).fetchone()["n"])
+
+
+def count_new_on(conn: sqlite3.Connection, user_id: int, today: date) -> int:
+    return int(conn.execute(
+        "SELECT COUNT(*) AS n FROM daily_tasks WHERE user_id = ? AND sent_on = ? AND is_new = 1",
+        (user_id, today.isoformat())).fetchone()["n"])
+
+
+def count_new_since(conn: sqlite3.Connection, user_id: int, since: date, today: date) -> int:
+    """Число различных карточек, выданных как новые в [since, today] (ISO-даты — строками)."""
+    return int(conn.execute(
+        "SELECT COUNT(DISTINCT card_id) AS n FROM daily_tasks"
+        " WHERE user_id = ? AND is_new = 1 AND sent_on BETWEEN ? AND ?",
+        (user_id, since.isoformat(), today.isoformat())).fetchone()["n"])
+
+
+def last_new_on(conn: sqlite3.Connection, user_id: int) -> date | None:
+    row = conn.execute(
+        "SELECT MAX(sent_on) AS d FROM daily_tasks WHERE user_id = ? AND is_new = 1",
+        (user_id,)).fetchone()
+    return date.fromisoformat(row["d"]) if row["d"] else None
+
+
+def touch_task_issued_at(conn: sqlite3.Connection, task_id: int, now: datetime) -> None:
+    """issued_at = now; now — aware UTC (как daily._utcnow()), пишется ISO-строкой."""
+    conn.execute("UPDATE daily_tasks SET issued_at = ? WHERE id = ?", (now.isoformat(), task_id))
+    conn.commit()
 
 
 def recent_sentences(conn: sqlite3.Connection, card_id: int, n: int = 6) -> list[str]:
@@ -364,13 +417,6 @@ def recent_sentences(conn: sqlite3.Connection, card_id: int, n: int = 6) -> list
             if len(out) >= n:
                 return out
     return out
-
-
-def count_tasks_on(conn: sqlite3.Connection, user_id: int, today: date) -> int:
-    cur = conn.execute(
-        "SELECT COUNT(*) AS n FROM daily_tasks WHERE user_id = ? AND sent_on = ?",
-        (user_id, today.isoformat()))
-    return int(cur.fetchone()["n"])
 
 
 def get_daily_state(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row:

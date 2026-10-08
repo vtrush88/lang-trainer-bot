@@ -4,6 +4,7 @@ import asyncio
 from datetime import time
 from types import SimpleNamespace
 
+import pytest
 from aiogram import Router
 
 import bot as bot_module
@@ -109,7 +110,7 @@ async def test_main_wires_prepare_build_loop_and_cancels_loop(conn, monkeypatch)
 
     cfg = SimpleNamespace(db_path=":memory:", gemini_api_key="k", gemini_model="m",
                           gemini_fallback_model=None, bot_lang="en", telegram_token="t",
-                          allowed_user_ids={1}, daily_at=time(9, 30))
+                          allowed_user_ids={1}, daily_at=time(9, 30), daily_tz="Europe/Madrid")
     monkeypatch.setattr(bot_module.config, "load", lambda: cfg)
     monkeypatch.setattr(bot_module.db, "connect", lambda path: conn)
     prepared = []
@@ -161,3 +162,28 @@ async def test_setup_commands_failure_is_logged_not_raised(caplog):
         await bot_module.setup_commands(fake_bot, PROFILES["en"])   # не бросает
     fake_bot.set_my_commands.assert_awaited_once()
     assert "set_my_commands failed" in caplog.text
+
+
+@pytest.mark.parametrize("lang,tz", [("en", "Pacific/Kiritimati"), ("es", "Europe/Madrid")])
+async def test_main_configures_business_clock_first_for_both_profiles(conn, monkeypatch, lang, tz):
+    """clock.configure(cfg.daily_tz) — в main, до prepare_db и хендлеров, для ОБОИХ ботов."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    order = []
+    cfg = SimpleNamespace(db_path=":memory:", gemini_api_key="k", gemini_model="m",
+                          gemini_fallback_model=None, bot_lang=lang, telegram_token="t",
+                          allowed_user_ids={1}, daily_at=None, daily_tz=tz)
+    monkeypatch.setattr(bot_module.config, "load", lambda: cfg)
+    monkeypatch.setattr(bot_module.clock, "configure", lambda name: order.append(("clock", name)))
+    monkeypatch.setattr(bot_module.db, "connect", lambda path: conn)
+    monkeypatch.setattr(bot_module, "prepare_db", lambda c: order.append(("prepare", None)))
+    monkeypatch.setattr(bot_module.genai, "Client", MagicMock())
+    fake_bot = MagicMock()
+    fake_bot.delete_webhook = AsyncMock()
+    fake_bot.set_my_commands = AsyncMock()
+    monkeypatch.setattr(bot_module, "Bot", MagicMock(return_value=fake_bot))
+    dp = MagicMock()
+    dp.start_polling = AsyncMock()
+    monkeypatch.setattr(bot_module, "build_dispatcher", lambda **kw: dp)
+    await bot_module.main()
+    assert order[0] == ("clock", tz) and ("prepare", None) in order

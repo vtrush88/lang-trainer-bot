@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import date
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+import clock
 import db
 import formatting
 import intents
@@ -53,7 +53,7 @@ async def start_flashcards(
     profile: LanguageProfile,
 ) -> None:
     await leave_modes(state)  # leave any prior mode + drop pending add-previews
-    due = db.get_due_cards(conn, message.from_user.id, date.today())
+    due = db.get_due_cards(conn, message.from_user.id, clock.today())
     if not due:
         await message.answer(EMPTY)
         return
@@ -94,7 +94,7 @@ async def grade_flashcard(call: CallbackQuery, state: FSMContext,
     if card_id not in retried:  # first encounter drives scheduling
         new_interval = srs.next_interval(card["interval_days"], remembered)
         db.update_review(conn, card_id, interval_days=new_interval,
-                         due_at=srs.due_on(date.today(), new_interval),
+                         due_at=srs.due_on(clock.today(), new_interval),
                          remembered=remembered)
     new_queue, new_retried = session.advance(
         queue, retried, remembered=remembered, giveup=False)
@@ -129,7 +129,7 @@ async def start_translate(
     profile: LanguageProfile,
 ) -> None:
     await leave_modes(state)  # leave any prior mode + drop pending add-previews
-    due = db.get_due_cards(conn, message.from_user.id, date.today())
+    due = db.get_due_cards(conn, message.from_user.id, clock.today())
     if not due:
         await message.answer(EMPTY)
         return
@@ -208,7 +208,7 @@ async def check_translation(
     if card_id not in retried:  # first encounter drives scheduling
         new_interval = srs.next_interval(card["interval_days"], ok)
         db.update_review(conn, card_id, interval_days=new_interval,
-                         due_at=srs.due_on(date.today(), new_interval),
+                         due_at=srs.due_on(clock.today(), new_interval),
                          remembered=ok)
     new_queue, new_retried = session.advance(
         queue, retried, remembered=ok, giveup=giveup)
@@ -243,7 +243,7 @@ async def start_listen(
     profile: LanguageProfile,
 ) -> None:
     await leave_modes(state)  # leave any prior mode + drop pending add-previews
-    due = db.get_due_cards(conn, message.from_user.id, date.today())
+    due = db.get_due_cards(conn, message.from_user.id, clock.today())
     if not due:
         await message.answer(EMPTY)
         return
@@ -282,7 +282,7 @@ async def check_listen(
     if card_id not in retried:  # first encounter drives scheduling
         new_interval = srs.next_interval(card["interval_days"], ok)
         db.update_review(conn, card_id, interval_days=new_interval,
-                         due_at=srs.due_on(date.today(), new_interval),
+                         due_at=srs.due_on(clock.today(), new_interval),
                          remembered=ok)
     new_queue, new_retried = session.advance(
         queue, retried, remembered=ok, giveup=giveup)

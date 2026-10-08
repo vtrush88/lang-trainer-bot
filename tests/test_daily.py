@@ -150,8 +150,8 @@ def test_clarify_min_words_and_ttl_constants():
     assert daily.NEXT_TASK_TTL == timedelta(minutes=15)
 
 
-def _t(*, morning, issued_at):
-    return {"morning": int(morning), "issued_at": issued_at}
+def _t(*, morning, issued_at, requested=True):
+    return {"morning": int(morning), "issued_at": issued_at, "requested": int(requested)}
 
 
 def test_is_stale():
@@ -163,6 +163,8 @@ def test_is_stale():
     assert daily.is_stale(_t(morning=False, issued_at=iso(14)), now) is False
     assert daily.is_stale(_t(morning=False, issued_at=iso(15)), now) is True
     assert daily.is_stale(_t(morning=False, issued_at=iso(60)), now) is True
+    # Round 1: «переспрос» — только для явно запрошенных через /next; цепочка — никогда
+    assert daily.is_stale(_t(morning=False, issued_at=iso(60), requested=False), now) is False
 
 
 
@@ -178,8 +180,10 @@ def test_is_stale_malformed_issued_at_is_not_stale_and_warns(caplog):
     from datetime import timezone
     now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
     with caplog.at_level("WARNING", logger="daily"):
-        assert daily.is_stale({"id": 9001, "morning": 0, "issued_at": "yesterday-ish"}, now) is False
-        assert daily.is_stale({"id": 9001, "morning": 0, "issued_at": "yesterday-ish"}, now) is False
+        assert daily.is_stale({"id": 9001, "morning": 0, "requested": 1,
+                               "issued_at": "yesterday-ish"}, now) is False
+        assert daily.is_stale({"id": 9001, "morning": 0, "requested": 1,
+                               "issued_at": "yesterday-ish"}, now) is False
     warns = [r for r in caplog.records if "issued_at" in r.getMessage()]
     assert len(warns) == 1                                   # одно предупреждение на задачу
 
@@ -365,3 +369,73 @@ def test_fit_caption_escape_heavy_keeps_content():
         out = daily.fit_caption(text)
         assert 500 < len(out) <= daily.CAPTION_LIMIT and out.endswith("…")
         assert not re.search(r"&(?!amp;|lt;|gt;)", out[:-1])
+
+
+# ---- расписание новых слов ----
+def test_schedule_constants():
+    assert (daily.MAX_REPEATS_PER_DAY, daily.NEW_PER_WEEK, daily.NEW_MIN_GAP_DAYS) == (5, 2, 3)
+    assert isinstance(daily.rng, random.Random)
+
+
+@pytest.mark.parametrize("d, monday", [
+    (date(2026, 10, 5), date(2026, 10, 5)),    # понедельник
+    (date(2026, 10, 8), date(2026, 10, 5)),    # четверг
+    (date(2026, 10, 11), date(2026, 10, 5)),   # воскресенье
+    (date(2026, 10, 12), date(2026, 10, 12)),  # следующий понедельник
+])
+def test_week_start(d, monday):
+    assert daily.week_start(d) == monday
+
+
+@pytest.mark.parametrize("count, last, today, allowed", [
+    (0, None, date(2026, 10, 7), True),
+    (1, date(2026, 10, 5), date(2026, 10, 8), True),     # ровно 3 дня
+    (1, date(2026, 10, 5), date(2026, 10, 7), False),    # 2 дня — рано
+    (2, date(2026, 10, 5), date(2026, 10, 9), False),    # норма недели исчерпана
+    (0, date(2026, 10, 4), date(2026, 10, 5), False),    # граница недели: гап не прошёл
+    (0, date(2026, 10, 4), date(2026, 10, 7), True),     # новая неделя, гап прошёл
+])
+def test_new_word_allowed(count, last, today, allowed):
+    assert daily.new_word_allowed(count_this_week=count, last_new=last, today=today) is allowed
+
+
+@pytest.mark.parametrize("count, last, today, days", [
+    (0, None, date(2026, 10, 7), 0),
+    (1, date(2026, 10, 6), date(2026, 10, 7), 2),     # гап
+    (2, date(2026, 10, 5), date(2026, 10, 8), 4),     # неделя: до пн 12-го
+    (2, date(2026, 10, 7), date(2026, 10, 8), 4),     # оба: гап 2, неделя 4
+    (2, date(2026, 10, 5), date(2026, 10, 11), 1),    # воскресенье → завтра
+    (1, date(2026, 10, 11), date(2026, 10, 11), 3),   # гап в тот же день
+])
+def test_days_until_new_word(count, last, today, days):
+    assert daily.days_until_new_word(count_this_week=count, last_new=last, today=today) == days
+
+
+def test_days_until_new_word_never_zero_when_not_allowed():
+    base = date(2026, 10, 5)
+    for offset in range(14):
+        today = date.fromordinal(base.toordinal() + offset)
+        for count in range(0, 4):
+            for gap in [None, *range(0, 8)]:
+                last = None if gap is None else date.fromordinal(today.toordinal() - gap)
+                kw = dict(count_this_week=count, last_new=last, today=today)
+                if not daily.new_word_allowed(**kw):
+                    assert daily.days_until_new_word(**kw) >= 1
+
+
+@pytest.mark.parametrize("n, text", [
+    (1, "завтра"), (2, "через 2 дня"), (3, "через 3 дня"), (4, "через 4 дня"),
+    (5, "через 5 дней"), (11, "через 11 дней"), (14, "через 14 дней"),
+    (21, "через 21 день"), (22, "через 22 дня"), (25, "через 25 дней"),
+])
+def test_when_text(n, text):
+    assert daily.when_text(n) == text
+
+
+def test_new_schedule_texts():
+    assert daily.TEXT_NEXT_LATER.format(when="завтра") == "Новое слово будет завтра 🙂"
+    assert daily.TEXT_NEXT_TOMORROW == "Сохранённое сегодня придёт завтра 🙂"
+    assert daily.TEXT_NO_NEW_WORDS == "Новых слов нет — перешли что-нибудь 🙂"
+    assert daily.TEXT_NEXT_FAILED == ("Не получилось выдать задание сейчас 😕 "
+                                       "Попробуй /next через минутку.")
+    assert daily.TEXT_SAVED == "Сохранено ✅ — придёт с ближайшим новым словом."

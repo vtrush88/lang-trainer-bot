@@ -9,9 +9,7 @@
 callback-префикс берёт только запись своего вида."""
 from __future__ import annotations
 
-import random
 import sqlite3
-from datetime import date
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -19,6 +17,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+import clock
 import daily
 import db
 import formatting
@@ -27,7 +26,6 @@ from languages import LanguageProfile
 from services.llm import LLM
 
 router = Router()
-_rng = random.Random()
 
 TEXT_INACTIVE = "Эта карточка уже неактивна 🙂"
 
@@ -60,42 +58,50 @@ async def _pop(state: FSMContext, seq: str, key: str) -> dict | None:
     return entry
 
 
+def _days_until_new_word(conn: sqlite3.Connection, uid: int, today) -> int:
+    """Через сколько дней норма пустит новое слово. Чтение вне лока — принятая гонка:
+    максимум ошибка в днях на границе суток."""
+    return daily.days_until_new_word(
+        count_this_week=db.count_new_since(conn, uid, daily.week_start(today), today),
+        last_new=db.last_new_on(conn, uid), today=today)
+
+
 @router.message(Command("next"), StateFilter(None))
 async def cmd_next(message: Message, conn: sqlite3.Connection, llm: LLM,
                    profile: LanguageProfile) -> None:
-    result = await daily.send_daily_task(message.bot, conn, llm, profile, message.from_user.id,
-                                         date.today(), _rng, morning=False)
-    if result == "nothing":
-        await message.answer(daily.TEXT_NOTHING_NEXT)
+    """/next — новое слово в рамках недельной нормы (повторы приходят сами)."""
+    uid = message.from_user.id
+    today = clock.today()
+    result = await daily.send_daily_task(message.bot, conn, llm, profile, uid, today,
+                                         want_new=True)
+    if result == "later":
+        days = _days_until_new_word(conn, uid, today)
+        await message.answer(daily.TEXT_NEXT_LATER.format(when=daily.when_text(days)))
+    elif result == "tomorrow":
+        days = _days_until_new_word(conn, uid, today)
+        if days > 1:   # сохранённое сегодня придёт не завтра, а когда пустит норма
+            await message.answer(daily.TEXT_NEXT_SAVED_WHEN.format(when=daily.when_text(days)))
+        else:
+            await message.answer(daily.TEXT_NEXT_TOMORROW)
+    elif result == "nothing":
+        await message.answer(daily.TEXT_NO_NEW_WORDS)
     elif result == "failed":
-        await message.answer(daily.TEXT_CAPTURE_FAILED)
+        await message.answer(daily.TEXT_NEXT_FAILED)
 
 
 async def _drop_markup(call: CallbackQuery) -> None:
+    """Снять inline-кнопки; любой сбой Telegram (в т.ч. сеть) не мешает остальному."""
     try:
         await call.message.edit_reply_markup(reply_markup=None)
-    except TelegramBadRequest:
+    except daily.TELEGRAM_SEND_ERRORS:
         pass
 
 
 @router.callback_query(StateFilter(None), F.data.startswith("more:"))
-async def on_more(call: CallbackQuery, conn: sqlite3.Connection, llm: LLM,
-                  profile: LanguageProfile) -> None:
+async def on_old_more(call: CallbackQuery) -> None:
+    """Старые «Ещё одно» в истории чата: снять кнопку и объяснить; задание не выдаём."""
+    await call.answer(daily.TEXT_MORE_GONE)   # сначала снять «крутилку»
     await _drop_markup(call)
-    await call.answer()   # сразу снять «крутилку»: дальше Gemini + TTS
-    today = date.today()
-    if call.data.split(":", 1)[1] != today.isoformat():
-        await call.message.answer(daily.TEXT_MORE_STALE)
-    else:
-        result = await daily.send_daily_task(call.message.bot, conn, llm, profile,
-                                             call.from_user.id, today, _rng, morning=False,
-                                             limit=daily.MAX_TASKS_PER_DAY)
-        if result == "limit":
-            await call.message.answer(daily.TEXT_MORE_LIMIT)
-        elif result == "nothing":
-            await call.message.answer(daily.TEXT_MORE_EMPTY)
-        elif result == "failed":
-            await call.message.answer(daily.TEXT_CAPTURE_FAILED)
 
 
 async def _capture(message: Message, state: FSMContext, conn: sqlite3.Connection, llm: LLM,
@@ -140,7 +146,7 @@ async def on_take_yes(call: CallbackQuery, state: FSMContext, conn: sqlite3.Conn
     db.add_card(conn, user_id=call.from_user.id, kind=item["kind"], word=item["word"],
                 translation=item["translation"], transcription=item["transcription"],
                 example=item["example"], example_translation=item["example_translation"],
-                enriched=True, today=date.today(), context=item.get("context"))
+                enriched=True, today=clock.today(), context=item.get("context"))
     db.reset_missed(conn, call.from_user.id)   # добавила слово → тихий режим снят
     await _finish(call, daily.TEXT_SAVED)
 
@@ -171,7 +177,7 @@ async def on_clarify(call: CallbackQuery, state: FSMContext, conn: sqlite3.Conne
         result = "stale"
         if task is not None and task["id"] == entry["task_id"]:
             result = await daily.answer_task(call.message.bot, conn, llm, profile, uid,
-                                             entry["text"], date.today(), giveup=False,
+                                             entry["text"], clock.today(), giveup=False,
                                              task_id=entry["task_id"])
         if result == "stale":   # "busy" (ещё оценивается/уже отвечено) — молча
             await call.message.answer(daily.TEXT_CLARIFY_STALE)
@@ -196,7 +202,7 @@ async def on_free_text(message: Message, state: FSMContext, conn: sqlite3.Connec
                        daily.strip_capture_prefix(message.text), uid)
     elif verdict in ("giveup", "answer"):
         result = await daily.answer_task(message.bot, conn, llm, profile, uid, message.text,
-                                         date.today(), giveup=(verdict == "giveup"),
+                                         clock.today(), giveup=(verdict == "giveup"),
                                          task_id=task["id"])
         if result == "stale":   # утро успело сменить задание
             await message.answer(daily.TEXT_CLARIFY_STALE)

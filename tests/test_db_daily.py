@@ -81,11 +81,11 @@ def test_add_card_stores_context(conn):
 def _task(conn, card_id, *, today=D0, morning=True, kind="gap",
           sentence="Just a heads-up, tests are late.",
           sentence_ru="Предупреждаю: тесты опаздывают.",
-          phrase_form="a heads-up", from_example=False, user_id=U):
+          phrase_form="a heads-up", from_example=False, user_id=U, is_new=False):
     return db.create_task(
         conn, user_id=user_id, card_id=card_id, kind=kind, sentence=sentence,
         sentence_ru=sentence_ru, phrase_form=phrase_form,
-        from_example=from_example, today=today, morning=morning)
+        from_example=from_example, today=today, morning=morning, is_new=is_new)
 
 
 def test_daily_tables_exist(conn):
@@ -190,37 +190,6 @@ def test_release_stale_grading_on_startup(conn):
     assert db.release_stale_grading(conn) == 0
 
 
-def test_pick_due_card_prefers_new_then_most_overdue(conn):
-    today = date(2026, 10, 5)
-    old = _add(conn, "old phrase", today=date(2026, 9, 1))
-    db.update_review(conn, old, interval_days=3, due_at=date(2026, 9, 4), remembered=True)
-    older = _add(conn, "older phrase", today=date(2026, 8, 1))
-    db.update_review(conn, older, interval_days=7, due_at=date(2026, 8, 8), remembered=True)
-    new = _add(conn, "new phrase", today=date(2026, 10, 4))
-    assert db.pick_due_card(conn, U, today)["id"] == new           # новая первой
-    db.update_review(conn, new, interval_days=1, due_at=date(2026, 10, 6), remembered=True)
-    assert db.pick_due_card(conn, U, today)["id"] == older         # самая просроченная
-
-
-def test_pick_due_card_skips_today_created_unenriched_and_untranslated(conn):
-    today = date(2026, 10, 5)
-    _add(conn, "created today", today=today)                       # created_at == today
-    _add(conn, "not enriched", today=date(2026, 10, 1), enriched=False)
-    _add(conn, "no translation", today=date(2026, 10, 1), translation=None)
-    _add(conn, "empty translation", today=date(2026, 10, 1), translation="")
-    assert db.pick_due_card(conn, U, today) is None
-    ok = _add(conn, "fine", today=date(2026, 10, 4))
-    assert db.pick_due_card(conn, U, today)["id"] == ok
-    assert db.pick_due_card(conn, 999, today) is None
-
-
-def test_pick_due_card_respects_due_at(conn):
-    today = date(2026, 10, 5)
-    cid = _add(conn, "fine", today=date(2026, 10, 1))
-    db.update_review(conn, cid, interval_days=30, due_at=date(2026, 11, 1), remembered=True)
-    assert db.pick_due_card(conn, U, today) is None
-
-
 def test_recent_sentences_includes_replies_excludes_examples(conn):
     cid = _add(conn, "a heads-up")
     t1 = _task(conn, cid, sentence="S1", sentence_ru="r", morning=False)
@@ -232,15 +201,6 @@ def test_recent_sentences_includes_replies_excludes_examples(conn):
     assert db.recent_sentences(conn, cid) == ["S3", "S1", "R2", "R1"]   # EX исключён, R2 — нет
     assert db.recent_sentences(conn, cid, n=2) == ["S3", "S1"]
     assert db.recent_sentences(conn, 12345) == []
-
-
-def test_count_tasks_on(conn):
-    cid = _add(conn, "a heads-up")
-    t = _task(conn, cid, today=date(2026, 10, 5)); db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
-    t = _task(conn, cid, today=date(2026, 10, 5), morning=False); db.claim_task(conn, t); db.finish_task(conn, t, ok=True)
-    _task(conn, cid, today=date(2026, 10, 4))
-    assert db.count_tasks_on(conn, U, date(2026, 10, 5)) == 2
-    assert db.count_tasks_on(conn, U, date(2026, 10, 6)) == 0
 
 
 def test_daily_state_counters(conn):
@@ -320,3 +280,167 @@ def test_create_task_accepts_explicit_issued_at(conn):
                          sentence_ru=None, phrase_form=None, from_example=False,
                          today=D0, morning=False, issued_at=at)
     assert db.get_task(conn, tid)["issued_at"] == at.isoformat()
+
+
+# ---- Task 1 (2026-10-08): расписание повторов и новых слов ----
+
+def _tasks_sql(conn, card_id, kind, sent_on):
+    conn.execute(
+        "INSERT INTO daily_tasks (user_id, card_id, kind, sent_on) VALUES (?,?,?,?)",
+        (U, card_id, kind, sent_on))
+    conn.commit()
+
+
+def _legacy_db(conn_path):
+    c = db.connect(conn_path)
+    db.init_db(c)
+    c.execute("ALTER TABLE daily_tasks DROP COLUMN is_new")
+    c.commit()
+    return c
+
+
+def test_is_new_column_migration_idempotent(tmp_path):
+    c = _legacy_db(str(tmp_path / "l.db"))
+    assert "is_new" not in _columns(c, "daily_tasks")
+    db.init_db(c)
+    db.init_db(c)
+    assert "is_new" in _columns(c, "daily_tasks")
+    info = [r for r in c.execute("PRAGMA table_info(daily_tasks)") if r[1] == "is_new"][0]
+    assert info["notnull"] == 1 and info["dflt_value"] == "0"
+
+
+def test_backfill_marks_only_compose_hinted_and_counts_legacy_week(tmp_path):
+    c = _legacy_db(str(tmp_path / "l.db"))
+    c1 = _add(c, "a"); c2 = _add(c, "b")
+    c.execute("INSERT INTO daily_tasks (user_id, card_id, kind, sent_on) VALUES (?,?,?,?)",
+              (U, c1, "compose_hinted", "2026-10-07"))
+    c.execute("UPDATE daily_tasks SET status = 'answered'")
+    c.execute("INSERT INTO daily_tasks (user_id, card_id, kind, sent_on) VALUES (?,?,?,?)",
+              (U, c2, "gap", "2026-10-07"))
+    c.commit()
+    db.init_db(c)
+    kinds = {r["kind"]: r["is_new"] for r in c.execute("SELECT kind, is_new FROM daily_tasks")}
+    assert kinds == {"compose_hinted": 1, "gap": 0}
+    assert db.count_new_since(c, U, date(2026, 10, 5), date(2026, 10, 8)) == 1
+
+
+def test_backfill_reruns_on_interrupted_migration(conn):
+    # колонка уже есть, но UPDATE не отработал (процесс упал после ALTER)
+    cid = _add(conn, "a")
+    _tasks_sql(conn, cid, "compose_hinted", "2026-10-07")
+    assert conn.execute("SELECT is_new FROM daily_tasks").fetchone()[0] == 0
+    db.init_db(conn)
+    assert conn.execute("SELECT is_new FROM daily_tasks").fetchone()[0] == 1
+    db.init_db(conn)
+    assert conn.execute("SELECT is_new FROM daily_tasks").fetchone()[0] == 1
+
+
+def test_count_new_since_counts_card_once(conn):
+    cid = _add(conn, "a")
+    _task(conn, cid, is_new=True, today=date(2026, 10, 6), morning=True)
+    conn.execute("UPDATE daily_tasks SET status='expired'"); conn.commit()
+    _task(conn, cid, is_new=True, today=date(2026, 10, 7))
+    assert db.count_new_since(conn, U, date(2026, 10, 5), date(2026, 10, 8)) == 1
+    assert db.count_new_since(conn, U, date(2026, 10, 7), date(2026, 10, 8)) == 1
+    assert db.count_new_since(conn, U, date(2026, 10, 8), date(2026, 10, 8)) == 0
+
+
+def test_pick_due_repeat_order_and_filters(conn):
+    a = _add(conn, "a"); b = _add(conn, "b"); c = _add(conn, "c"); n = _add(conn, "n")
+    d = _add(conn, "d", translation="")
+    for cid, iv, due in ((a, 1, "2026-10-06"), (b, 3, "2026-10-05"), (c, 3, "2026-10-05"),
+                         (d, 1, "2026-10-01")):
+        conn.execute("UPDATE cards SET interval_days=?, due_at=? WHERE id=?", (iv, due, cid))
+    conn.execute("UPDATE cards SET due_at='2026-10-01' WHERE id=?", (n,))  # interval 0
+    conn.commit()
+    assert db.pick_due_repeat(conn, U, date(2026, 10, 8))["id"] == b  # самый просроченный, tie по id
+    assert db.pick_due_repeat(conn, U, date(2026, 10, 4)) is None
+
+
+def test_pick_new_card_order(conn):
+    old = _add(conn, "old", today=date(2026, 9, 1))
+    shown = _add(conn, "shown", today=date(2026, 9, 2))
+    fresh = _add(conn, "fresh", today=date(2026, 9, 3))
+    todayc = _add(conn, "todayc", today=date(2026, 10, 8))
+    _task(conn, shown, is_new=True, today=date(2026, 10, 1))
+    conn.execute("UPDATE daily_tasks SET status='expired'"); conn.commit()
+    t = date(2026, 10, 8)
+    assert db.pick_new_card(conn, U, t)["id"] == fresh      # не показанные первыми, свежие первыми
+    conn.execute("UPDATE cards SET interval_days=1 WHERE id=?", (fresh,)); conn.commit()
+    assert db.pick_new_card(conn, U, t)["id"] == old
+    conn.execute("UPDATE cards SET interval_days=1 WHERE id=?", (old,)); conn.commit()
+    assert db.pick_new_card(conn, U, t)["id"] == shown      # затем показанные
+    assert todayc not in {db.pick_new_card(conn, U, t)["id"]}
+
+
+def test_has_new_cards_created_on(conn):
+    t = date(2026, 10, 8)
+    assert not db.has_new_cards_created_on(conn, U, t)
+    cid = _add(conn, "x", today=t)
+    assert db.has_new_cards_created_on(conn, U, t)
+    conn.execute("UPDATE cards SET interval_days=1 WHERE id=?", (cid,)); conn.commit()
+    assert not db.has_new_cards_created_on(conn, U, t)
+
+
+def test_counts_and_last_new_on(conn):
+    a = _add(conn, "a"); b = _add(conn, "b")
+    assert db.last_new_on(conn, U) is None
+    _task(conn, a, is_new=True, today=date(2026, 10, 5))
+    conn.execute("UPDATE daily_tasks SET status='answered'"); conn.commit()
+    _task(conn, b, today=date(2026, 10, 8))
+    assert db.count_new_on(conn, U, date(2026, 10, 5)) == 1
+    assert db.count_repeats_on(conn, U, date(2026, 10, 5)) == 0
+    assert db.count_repeats_on(conn, U, date(2026, 10, 8)) == 1
+    assert db.count_new_on(conn, U, date(2026, 10, 8)) == 0
+    assert db.last_new_on(conn, U) == date(2026, 10, 5)
+
+
+def test_touch_task_issued_at(conn):
+    from datetime import datetime, timezone
+    tid = _task(conn, _add(conn, "a"))
+    at = datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc)
+    db.touch_task_issued_at(conn, tid, at)
+    assert db.get_task(conn, tid)["issued_at"] == at.isoformat()
+
+
+def test_pick_new_card_skips_unenriched_untranslated_and_foreign(conn):
+    """Фильтры бывшего pick_due_card (Task 3 его удалил) — теперь у pick_new_card."""
+    t = date(2026, 10, 8)
+    _add(conn, "raw", enriched=False)
+    _add(conn, "notr", translation="")
+    assert db.pick_new_card(conn, U, t) is None
+    ok = _add(conn, "ok")
+    assert db.pick_new_card(conn, U, t)["id"] == ok
+    assert db.pick_new_card(conn, 999, t) is None
+
+
+def test_requested_column_migration_idempotent_and_create_task(tmp_path, conn):
+    c = db.connect(str(tmp_path / "l.db"))
+    db.init_db(c)
+    c.execute("ALTER TABLE daily_tasks DROP COLUMN requested")   # БД до Round 1
+    c.commit()
+    assert "requested" not in _columns(c, "daily_tasks")
+    db.init_db(c)
+    db.init_db(c)
+    info = [r for r in c.execute("PRAGMA table_info(daily_tasks)") if r[1] == "requested"][0]
+    assert info["notnull"] == 1 and info["dflt_value"] == "0"
+    cid = _add(conn, "a")
+    plain = db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence=None,
+                           sentence_ru=None, phrase_form=None, from_example=False,
+                           today=D0, morning=False)
+    assert db.get_task(conn, plain)["requested"] == 0
+    db.expire_task(conn, plain)
+    req = db.create_task(conn, user_id=U, card_id=cid, kind="gap", sentence=None,
+                         sentence_ru=None, phrase_form=None, from_example=False,
+                         today=D0, morning=False, requested=True)
+    assert db.get_task(conn, req)["requested"] == 1
+
+
+def test_has_new_cards_created_on_ignores_unenriched_and_untranslated(conn):
+    """Round 2: тот же фильтр _ENRICHED, что у pick_new_card."""
+    t = date(2026, 10, 8)
+    _add(conn, "raw", today=t, enriched=False)
+    _add(conn, "notr", today=t, translation="")
+    assert db.has_new_cards_created_on(conn, U, t) is False
+    _add(conn, "ok", today=t)
+    assert db.has_new_cards_created_on(conn, U, t) is True

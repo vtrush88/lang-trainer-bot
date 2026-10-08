@@ -5,13 +5,13 @@ import logging
 import os
 import sqlite3
 import tempfile
-from datetime import date
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
+import clock
 import db
 import formatting
 import keyboards
@@ -144,7 +144,7 @@ async def save_yes(
         word=card["word"], translation=card["translation"],
         transcription=card["transcription"], example=card["example"],
         example_translation=card["example_translation"],
-        enriched=True, today=date.today(),
+        enriched=True, today=clock.today(),
     )
     if profile.daily_practice:
         db.reset_missed(conn, call.from_user.id)  # добавила слово любым путём → тихий режим снят
