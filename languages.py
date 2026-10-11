@@ -40,6 +40,10 @@ class LanguageProfile:
     sentence_check_user_template: str = ""
     capture_system: str = ""
     capture_schema: dict | None = None
+    # подсказка в recall/gap (2026-10-11); .format(word=…, translation=…)
+    hint_system: str = ""
+    hint_schema: dict | None = None
+    hint_user_template: str = ""
 
 
 ES = LanguageProfile(
@@ -148,6 +152,12 @@ _EN_SENTENCE_CHECK_SCHEMA = {
     },
     "required": ["verdict", "corrected", "note", "reply_sentence",
                  "reply_sentence_ru", "reply_phrase_form"],
+}
+
+_EN_HINT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {"definition": {"type": "STRING"}},
+    "required": ["definition"],
 }
 
 _EN_CAPTURE_SCHEMA = {
@@ -338,6 +348,17 @@ EN = LanguageProfile(
         "Пол ученика неизвестен — без гендерных форм в его адрес."
     ),
     capture_schema=_EN_CAPTURE_SCHEMA,
+    hint_system=(
+        "Ты помогаешь русскоязычному ученику уровня B2 вспомнить английское слово или "
+        "фразу. Тебе дают слово/фразу и её русский перевод. Объясни значение "
+        "по-английски, как в учебном словаре (learner's dictionary): definition — "
+        "одно короткое объяснение уровня B2, не длиннее 20 слов, на американском "
+        "английском. НЕЛЬЗЯ употреблять само слово/фразу, его формы и однокоренные "
+        "слова — ученик должен вспомнить его сам. Без перевода на русский и без "
+        "примеров со словом. Пол ученика неизвестен — без гендерных форм в его адрес."
+    ),
+    hint_schema=_EN_HINT_SCHEMA,
+    hint_user_template="Слово: {word}\nПеревод: {translation}",
 )
 
 PROFILES: dict[str, LanguageProfile] = {"es": ES, "en": EN}

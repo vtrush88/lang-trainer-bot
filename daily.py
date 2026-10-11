@@ -26,7 +26,7 @@ import formatting
 import intents
 import voice
 from formatting import esc, field
-from services import capture, grading, sentences, srs, tts
+from services import capture, grading, hints, sentences, srs, tts
 from services.llm import QuotaExceededError
 
 VOICE_KINDS = frozenset({"compose_hinted", "listen"})
@@ -175,6 +175,39 @@ def _mentions_any(text: str, target: str | Iterable[str | None] | None) -> bool 
     return any(sentences.contains(text, t) for t in targets)
 
 
+_POLITE = r"(?:пожалуйста|please|pls)"
+_HINT_RE = re.compile(
+    rf"^(?:\?+|(?:{_POLITE}[\s,]+)?(?:дай(?:те)?\s+)?(?:подскажи(?:те)?|подсказка|подсказку|hint)"
+    rf"(?:[\s,]+{_POLITE})?)[?.!]*$", re.IGNORECASE)
+HINT_KINDS = frozenset({"recall", "gap"})
+
+
+def is_hint_request(text: str) -> bool:
+    """«подскажи» / «подсказка» / «подсказку» / «hint» / «?» — регистр и хвостовые ?.! не важны;
+    допускается вежливость вокруг: «дай подсказку», «подскажи пожалуйста», «hint please»."""
+    return bool(_HINT_RE.match(text.strip()))
+
+
+_MASK_SPLIT = re.compile(r"(\s+)")
+
+
+def mask_word(text: str) -> str:
+    """Маска ответа: в каждом слове (по пробелам) видна первая буква, остальные буквы → «_»;
+    пробелы, дефисы, апострофы и прочие не-буквы сохраняются: heads-up → h____-__."""
+    out = []
+    for part in _MASK_SPLIT.split(text):
+        seen_letter = False
+        chars = []
+        for ch in part:
+            if ch.isalpha():
+                chars.append("_" if seen_letter else ch)
+                seen_letter = True
+            else:
+                chars.append(ch)
+        out.append("".join(chars))
+    return "".join(out)
+
+
 def classify_incoming(text: str, *, forwarded: bool, has_open_task: bool,
                       target: str | Iterable[str | None] | None = None,
                       stale: bool = False) -> str:
@@ -190,6 +223,8 @@ def classify_incoming(text: str, *, forwarded: bool, has_open_task: bool,
         return "capture"
     if not has_open_task:
         return "capture"
+    if is_hint_request(t):   # до giveup, кириллицы и stale: подсказка — не ответ
+        return "hint"
     if intents.is_giveup(t) and len(t.split()) <= GIVEUP_MAX_WORDS:
         return "giveup"
     if _CYRILLIC.search(t):
@@ -243,6 +278,8 @@ TEXT_COPIED_HINT = "Это предложение из подсказки 🙂 �
 TEXT_CLARIFY = "Это ответ на задание или новое слово?"
 TEXT_CLARIFY_STALE = "Это задание уже истекло, напиши ответ на новое 🙂"
 TEXT_EMPTY_CAPTURE = "После «+» напиши слово или фразу 🙂"
+TEXT_NO_HINT = "В этом задании подсказки нет 🙂 Напиши, что получается."
+TEXT_HINT_HOLD = "(с подсказкой — ступень не меняется)"
 TEXT_QUOTA_COMPOSE = ("✅ Принято! (умная проверка пока недоступна — лимит бесплатных "
                       "запросов; своё предложение всё равно засчитано)")
 
@@ -328,17 +365,30 @@ def render_compose_result(check: dict | None) -> str:
     return text
 
 
-def render_grade_result(verdict: dict | None, *, exact: bool, expected: str, quota: bool) -> str:
+def render_grade_result(verdict: dict | None, *, exact: bool, expected: str, quota: bool,
+                        card=None) -> str:
+    """❌-ветки (неверно и квота) — с полной карточкой (произношение, пример, контекст), если
+    card передан; ✅/«почти» — без неё."""
     if exact:
         return "✅ Верно!"
     if quota or verdict is None:
-        return (f"❌ Правильно: {esc(expected)}\n(умная проверка пока недоступна — "
+        text = (f"❌ Правильно: {esc(expected)}\n(умная проверка пока недоступна — "
                 "лимит бесплатных запросов; сравни свой ответ с правильным)")
-    if verdict["verdict"] == "correct":
+    elif verdict["verdict"] == "correct":
         return "✅ Верно!"
-    if verdict["verdict"] == "typo":
+    elif verdict["verdict"] == "typo":
         return f"✅ Почти! Правильно: {esc(verdict['correct'])} ({esc(verdict['note'])})"
-    return f"❌ Не совсем. Правильно: {esc(verdict['correct'])} ({esc(verdict['note'])})"
+    else:
+        text = f"❌ Не совсем. Правильно: {esc(verdict['correct'])} ({esc(verdict['note'])})"
+    if card is not None:
+        text += f"\n\n{formatting.card_preview(card)}"
+    return text
+
+
+def render_hint(definition: str | None, mask: str) -> str:
+    if definition:
+        return f"💡 {esc(definition)}\n\n<code>{esc(mask)}</code>"
+    return f"💡 <code>{esc(mask)}</code>"
 
 
 def render_listen_result(ok: bool, sentence: str) -> str:
@@ -618,10 +668,14 @@ async def grade_answer(llm, profile, task, card, answer: str, *, giveup: bool,
                                                   prompt_ru=prompt_ru, expected=expected,
                                                   answer=answer.strip())
                 ok = verdict["verdict"] in ("correct", "typo")
-                text = render_grade_result(verdict, exact=False, expected=expected, quota=False)
+                text = render_grade_result(verdict, exact=False, expected=expected, quota=False,
+                                           card=card)
             except QuotaExceededError:
                 ok = False
-                text = render_grade_result(None, exact=False, expected=expected, quota=True)
+                text = render_grade_result(None, exact=False, expected=expected, quota=True,
+                                           card=card)
+        if ok and field(task, "hinted"):
+            text += f"\n{TEXT_HINT_HOLD}"
         return Graded(ok, with_sentence(text, sentence), sentence or card["word"], None)
     if kind == "listen":
         ok = listen_ok(answer, sentence or "")
@@ -728,14 +782,71 @@ async def answer_task(bot, conn, llm, profile, user_id: int, text: str, today: d
                 await _chain_next(bot, conn, llm, profile, user_id, rng)
             return "done"
         if fresh["due_at"] <= today.isoformat():   # иначе ручная тренировка уже засчитала
-            interval = srs.next_interval(fresh["interval_days"], graded.ok)
-            db.update_review(conn, fresh["id"], interval_days=interval,
-                             due_at=srs.due_on(today, interval), remembered=graded.ok)
+            if graded.ok and _hint_hold(task):
+                # верно с подсказкой — удержание: ступень та же, срок от сегодня (≥ 1 дня)
+                interval = fresh["interval_days"]
+                db.update_review(conn, fresh["id"], interval_days=interval,
+                                 due_at=srs.due_on(today, max(interval, srs.LADDER[0])),
+                                 remembered=True)
+            else:
+                interval = srs.next_interval(fresh["interval_days"], graded.ok)
+                db.update_review(conn, fresh["id"], interval_days=interval,
+                                 due_at=srs.due_on(today, interval), remembered=graded.ok)
         db.finish_task(conn, task["id"], ok=graded.ok, reply_sentence=graded.reply_sentence)
         db.reset_missed(conn, user_id)
         if await _send_result(bot, conn, profile, user_id, fresh, graded):
             await _chain_next(bot, conn, llm, profile, user_id, rng)
         return "done"
+
+
+def _hint_hold(task) -> bool:
+    return task["kind"] in HINT_KINDS and bool(field(task, "hinted"))
+
+
+def hint_target(task, card) -> str:
+    """Что маскировать: recall — слово карточки, gap — вырезанная форма (или слово)."""
+    if task["kind"] == "gap":
+        return task["phrase_form"] or card["word"]
+    return card["word"]
+
+
+async def give_hint(bot, conn, llm, profile, user_id: int, task_id: int) -> str:
+    """Подсказка к открытой задаче — под локом пользователя, задача остаётся open.
+
+    "sent"    — подсказка доставлена (новая или сохранённая, без Gemini);
+    "no_hint" — вид задания без подсказки, отправлен TEXT_NO_HINT;
+    "stale"   — задачи нет / чужая / уже не open / карточка удалена: молча ничего;
+    "failed"  — не доставлено (hinted не ставится — ученик подсказку не видел).
+    """
+    async with user_lock(user_id):
+        task = db.get_task(conn, task_id)
+        if task is None or task["user_id"] != user_id or task["status"] != db.TASK_OPEN:
+            return "stale"
+        if task["kind"] not in HINT_KINDS:
+            return "no_hint" if await _safe_send(bot, user_id, TEXT_NO_HINT) else "failed"
+        text = task["hint"]
+        if not text:
+            card = db.get_card(conn, task["card_id"])
+            if card is None:
+                return "stale"
+            card_data = dict(card)   # в поток — только данные, не Row/соединение
+            try:
+                definition = await asyncio.to_thread(
+                    hints.make_hint, llm, profile, card_data,
+                    phrase_form=task["phrase_form"] if task["kind"] == "gap" else None)
+            except Exception:   # make_hint сам глотает сбои; страховка — только маска
+                log.exception("make_hint crashed for card %s", card["id"])
+                definition = None
+            text = render_hint(definition, mask_word(hint_target(task, card)))
+            cache = text if definition else None   # только маска — в следующий раз снова Gemini
+        try:
+            await bot.send_message(user_id, text, parse_mode="HTML")
+        except TELEGRAM_SEND_ERRORS as exc:
+            log.warning("hint to %s not delivered: %s", user_id, exc)
+            return "failed"
+        if not task["hint"]:
+            db.set_task_hint(conn, task["id"], cache)
+        return "sent"
 
 
 async def _close_deleted(bot, conn, user_id: int, task_id: int) -> bool:

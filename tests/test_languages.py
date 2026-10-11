@@ -231,3 +231,13 @@ def test_en_check_prompt_knows_hint_and_copy_rule():
     assert "Подсказка (предложение из задания): {hint}" in en.sentence_check_user_template
     assert "копией или лёгкой переделкой подсказки" in en.sentence_check_system
     assert "это предложение из подсказки, нужно своё" in en.sentence_check_system
+
+
+def test_en_hint_prompt_schema_template_and_es_defaults():
+    en, es = PROFILES["en"], PROFILES["es"]
+    assert "Пол ученика неизвестен" in en.hint_system
+    assert "однокоренн" in en.hint_system and "американ" in en.hint_system.lower()
+    _schema_ok(en.hint_schema)
+    assert en.hint_schema["required"] == ["definition"]
+    assert en.hint_user_template.format(word="w", translation="t") == "Слово: w\nПеревод: t"
+    assert es.hint_system == "" and es.hint_schema is None and es.hint_user_template == ""

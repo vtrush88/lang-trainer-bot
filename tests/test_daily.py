@@ -439,3 +439,51 @@ def test_new_schedule_texts():
     assert daily.TEXT_NEXT_FAILED == ("Не получилось выдать задание сейчас 😕 "
                                        "Попробуй /next через минутку.")
     assert daily.TEXT_SAVED == "Сохранено ✅ — придёт с ближайшим новым словом."
+
+
+# ---- подсказка (2026-10-11): триггеры и маска ----
+
+@pytest.mark.parametrize("text", ["подскажи", "Подсказка", "подсказку!", "hint", "HINT?", "?",
+                                  "??", " подскажи... ", "Hint."])
+def test_classify_incoming_hint_with_open_task(text):
+    assert daily.classify_incoming(text, forwarded=False, has_open_task=True,
+                                   target="span") == "hint"
+
+
+@pytest.mark.parametrize("text", ["подскажи", "hint", "?"])
+def test_classify_incoming_hint_without_task_is_capture(text):
+    assert daily.classify_incoming(text, forwarded=False, has_open_task=False) == "capture"
+
+
+def test_classify_incoming_hint_forwarded_or_plus_is_capture():
+    assert daily.classify_incoming("hint", forwarded=True, has_open_task=True) == "capture"
+    assert daily.classify_incoming("+ hint", forwarded=False, has_open_task=True) == "capture"
+
+
+def test_classify_incoming_hint_beats_stale_and_is_not_a_phrase():
+    assert daily.classify_incoming("подскажи", forwarded=False, has_open_task=True,
+                                   target="span", stale=True) == "hint"
+    assert daily.classify_incoming("hint me", forwarded=False, has_open_task=True,
+                                   target="span") == "answer"
+    assert daily.classify_incoming("What does it mean?", forwarded=False,
+                                   has_open_task=True, target="span") == "answer"
+    assert daily.classify_incoming("подскажи, как это сказать", forwarded=False,
+                                   has_open_task=True, target="span") == "clarify"
+
+
+@pytest.mark.parametrize("text", ["подскажи пожалуйста", "Дай подсказку", "hint please",
+                                  "подсказку, пожалуйста!", "please hint", "Пожалуйста, подскажи?"])
+def test_classify_incoming_hint_with_politeness(text):
+    assert daily.classify_incoming(text, forwarded=False, has_open_task=True,
+                                   target="span") == "hint"
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("heads", "h____"),
+    ("give someone a heads-up", "g___ s______ a h____-__"),
+    ("don't", "d__'_"),
+    ("someone's job", "s______'_ j__"),
+    ("A", "A"),
+])
+def test_mask_word(text, expected):
+    assert daily.mask_word(text) == expected

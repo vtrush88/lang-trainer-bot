@@ -444,3 +444,27 @@ def test_has_new_cards_created_on_ignores_unenriched_and_untranslated(conn):
     assert db.has_new_cards_created_on(conn, U, t) is False
     _add(conn, "ok", today=t)
     assert db.has_new_cards_created_on(conn, U, t) is True
+
+
+def test_hint_columns_migration_idempotent_and_set_task_hint(tmp_path, conn):
+    c = db.connect(str(tmp_path / "l.db"))
+    db.init_db(c)
+    c.execute("ALTER TABLE daily_tasks DROP COLUMN hinted")   # БД до подсказки (2026-10-11)
+    c.execute("ALTER TABLE daily_tasks DROP COLUMN hint")
+    c.commit()
+    assert {"hinted", "hint"}.isdisjoint(_columns(c, "daily_tasks"))
+    db.init_db(c)
+    db.init_db(c)
+    info = {r[1]: r for r in c.execute("PRAGMA table_info(daily_tasks)")}
+    assert info["hinted"]["notnull"] == 1 and info["hinted"]["dflt_value"] == "0"
+    assert info["hint"]["type"] == "TEXT"
+    cid = _add(conn, "a")
+    tid = db.create_task(conn, user_id=U, card_id=cid, kind="recall", sentence=None,
+                         sentence_ru=None, phrase_form=None, from_example=False,
+                         today=D0, morning=False)
+    task = db.get_task(conn, tid)
+    assert task["hinted"] == 0 and task["hint"] is None
+    db.set_task_hint(conn, tid, "💡 <code>a</code>")
+    task = db.get_task(conn, tid)
+    assert task["hinted"] == 1 and task["hint"] == "💡 <code>a</code>"
+    assert task["status"] == "open"

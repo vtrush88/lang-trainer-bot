@@ -200,6 +200,8 @@ async def on_free_text(message: Message, state: FSMContext, conn: sqlite3.Connec
     if verdict == "capture":
         await _capture(message, state, conn, llm, profile,
                        daily.strip_capture_prefix(message.text), uid)
+    elif verdict == "hint":   # и в stale-режиме: подсказка — не ответ, переспрос не нужен
+        await daily.give_hint(message.bot, conn, llm, profile, uid, task["id"])
     elif verdict in ("giveup", "answer"):
         result = await daily.answer_task(message.bot, conn, llm, profile, uid, message.text,
                                          clock.today(), giveup=(verdict == "giveup"),

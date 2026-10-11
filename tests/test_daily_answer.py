@@ -586,3 +586,225 @@ async def test_no_sixth_repeat_via_chain_when_cap_reached(conn, fake_tts, next_s
     assert await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False) == "done"
     assert len(bot.sent) == 1 and db.open_task(conn, U) is None
     assert db.count_repeats_on(conn, U, TODAY) == daily.MAX_REPEATS_PER_DAY
+
+
+# ---- подсказка и карточка при ошибке (2026-10-11) ----
+from datetime import timedelta  # noqa: E402
+
+from services import hints  # noqa: E402
+
+
+async def test_give_hint_sends_definition_and_mask_and_marks_task(conn, monkeypatch):
+    seen = []
+    monkeypatch.setattr(hints, "make_hint", lambda llm, p, card, **k: seen.append(card["word"])
+                        or "A warning <early>.")
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    bot = FakeBot()
+    assert await daily.give_hint(bot, conn, None, EN, U, tid) == "sent"
+    assert seen == ["a heads-up"]
+    kind, chat, text, kw = bot.sent[0]
+    assert (kind, chat, kw.get("parse_mode")) == ("message", U, "HTML")
+    assert text == "💡 A warning &lt;early&gt;.\n\n<code>a h____-__</code>"
+    task = db.get_task(conn, tid)
+    assert task["hinted"] == 1 and task["hint"] == text and task["status"] == "open"
+
+
+async def test_give_hint_second_request_reuses_stored_hint(conn, monkeypatch):
+    monkeypatch.setattr(hints, "make_hint", lambda *a: "Early warning.")
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    bot = FakeBot()
+    await daily.give_hint(bot, conn, None, EN, U, tid)
+    monkeypatch.setattr(hints, "make_hint", lambda *a: pytest.fail("Gemini не нужен"))
+    assert await daily.give_hint(bot, conn, None, EN, U, tid) == "sent"
+    assert len(bot.sent) == 2 and bot.sent[1][2] == bot.sent[0][2]
+
+
+async def test_give_hint_gap_masks_phrase_form_and_works_without_gemini(conn, monkeypatch):
+    monkeypatch.setattr(hints, "make_hint", lambda *a: None)
+    cid = _card(conn, interval=1, due=TODAY)
+    tid = _open(conn, cid, "gap", phrase_form="gave him a heads-up")
+    bot = FakeBot()
+    await daily.give_hint(bot, conn, None, EN, U, tid)
+    assert bot.sent[0][2] == "💡 <code>g___ h__ a h____-__</code>"
+    assert db.get_task(conn, tid)["hinted"] == 1
+
+
+@pytest.mark.parametrize("kind", ["listen", "compose", "compose_hinted"])
+async def test_give_hint_other_kinds_say_no_hint(conn, monkeypatch, kind):
+    monkeypatch.setattr(hints, "make_hint", lambda *a: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=7, due=TODAY)
+    tid = _open(conn, cid, kind)
+    bot = FakeBot()
+    assert await daily.give_hint(bot, conn, None, EN, U, tid) == "no_hint"
+    assert bot.sent[0][2] == daily.TEXT_NO_HINT
+    assert db.get_task(conn, tid)["hinted"] == 0
+
+
+async def test_give_hint_for_closed_task_is_silent(conn, monkeypatch):
+    monkeypatch.setattr(hints, "make_hint", lambda *a: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    db.expire_task(conn, tid)
+    bot = FakeBot()
+    assert await daily.give_hint(bot, conn, None, EN, U, tid) == "stale"
+    assert await daily.give_hint(bot, conn, None, EN, 999, tid) == "stale"
+    assert bot.sent == [] and db.get_task(conn, tid)["hinted"] == 0
+
+
+async def test_give_hint_not_marked_when_not_delivered(conn, monkeypatch):
+    monkeypatch.setattr(hints, "make_hint", lambda *a: "Early warning.")
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    await daily.give_hint(FakeBot(fail_for={U}), conn, None, EN, U, tid)
+    assert db.get_task(conn, tid)["hinted"] == 0
+
+
+async def test_hinted_correct_holds_rung(conn, fake_tts, monkeypatch):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: pytest.fail("Gemini не нужен"))
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    db.set_task_hint(conn, tid, "💡 x")
+    before = db.get_card(conn, cid)
+    bot = FakeBot()
+    assert await daily.answer_task(bot, conn, None, EN, U, "a heads-up", TODAY, giveup=False) == "done"
+    card = db.get_card(conn, cid)
+    assert card["interval_days"] == 3
+    assert card["due_at"] == (TODAY + timedelta(days=3)).isoformat()
+    assert card["lapses"] == before["lapses"] and card["reps"] == before["reps"] + 1
+    text = bot.sent[0][2]
+    assert text.startswith("✅ Верно!") and "(с подсказкой — ступень не меняется)" in text
+    assert db.get_task(conn, tid)["answered_ok"] == 1
+
+
+async def test_hinted_typo_also_holds_rung(conn, fake_tts, monkeypatch):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: {"verdict": "typo", "correct": "a heads-up",
+                                                           "note": "дефис"})
+    cid = _card(conn, interval=7, due=TODAY)
+    tid = _open(conn, cid, "gap")
+    db.set_task_hint(conn, tid, "💡 x")
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "a headsup", TODAY, giveup=False)
+    assert db.get_card(conn, cid)["interval_days"] == 7
+    assert "ступень не меняется" in bot.sent[0][2]
+
+
+async def test_hinted_wrong_is_lapse_as_usual(conn, fake_tts, monkeypatch):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: {"verdict": "wrong", "correct": "a heads-up",
+                                                           "note": "не то"})
+    cid = _card(conn, interval=7, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    db.set_task_hint(conn, tid, "💡 x")
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "a warning", TODAY, giveup=False)
+    card = db.get_card(conn, cid)
+    assert card["interval_days"] == 1 and card["lapses"] == 1
+    assert "ступень не меняется" not in bot.sent[0][2]
+
+
+async def test_hinted_giveup_is_lapse_as_usual(conn, fake_tts):
+    cid = _card(conn, interval=7, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    db.set_task_hint(conn, tid, "💡 x")
+    await daily.answer_task(FakeBot(), conn, None, EN, U, "не помню", TODAY, giveup=True)
+    card = db.get_card(conn, cid)
+    assert card["interval_days"] == 1 and card["lapses"] == 1
+
+
+async def test_hinted_correct_on_card_not_due_keeps_srs(conn, fake_tts):
+    cid = _card(conn, interval=3, due=TODAY + timedelta(days=3))   # ручная тренировка уже засчитала
+    tid = _open(conn, cid, "recall")
+    db.set_task_hint(conn, tid, "💡 x")
+    before = db.get_card(conn, cid)
+    await daily.answer_task(FakeBot(), conn, None, EN, U, "a heads-up", TODAY, giveup=False)
+    after = db.get_card(conn, cid)
+    assert (after["interval_days"], after["due_at"], after["reps"]) == (
+        before["interval_days"], before["due_at"], before["reps"])
+
+
+def _has_card(text):
+    return ("🗣 произношение: /x/" in text and "📝 пример: Just a heads-up: tests are late." in text
+            and "📍 контекст: созвон" in text)
+
+
+@pytest.mark.parametrize("kind", ["recall", "gap"])
+async def test_wrong_answer_shows_full_card(conn, fake_tts, monkeypatch, kind):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: {"verdict": "wrong", "correct": "a heads-up",
+                                                           "note": "не то"})
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, kind)
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "a warning", TODAY, giveup=False)
+    text = bot.sent[0][2]
+    assert text.startswith("❌ Не совсем") and _has_card(text)
+    assert text.index("❌") < text.index("🔤") < text.index(f"🔊 <i>{S}</i>")
+
+
+async def test_correct_answer_has_no_card(conn, fake_tts, monkeypatch):
+    monkeypatch.setattr(grading, "grade", lambda *a, **k: {"verdict": "typo", "correct": "a heads-up",
+                                                           "note": "дефис"})
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall")
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "a headsup", TODAY, giveup=False)
+    assert not _has_card(bot.sent[0][2]) and "🗣" not in bot.sent[0][2]
+    cid2 = _card(conn, word="span", interval=3, due=TODAY)
+    _open(conn, cid2, "recall", sentence=None, phrase_form=None)
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "span", TODAY, giveup=False)   # точное
+    assert "🗣" not in bot.sent[0][2]
+
+
+async def test_quota_result_shows_full_card(conn, fake_tts, monkeypatch):
+    def boom(*a, **k):
+        raise QuotaExceededError("q")
+    monkeypatch.setattr(grading, "grade", boom)
+    cid = _card(conn, interval=3, due=TODAY)
+    _open(conn, cid, "recall")
+    bot = FakeBot()
+    await daily.answer_task(bot, conn, None, EN, U, "heads", TODAY, giveup=False)
+    assert "лимит" in bot.sent[0][2] and _has_card(bot.sent[0][2])
+
+
+def test_render_grade_result_card_only_on_wrong():
+    card = {"word": "w<", "translation": "t", "transcription": "/x/", "example": "e",
+            "example_translation": "э", "context": None}
+    wrong = daily.render_grade_result({"verdict": "wrong", "correct": "w<", "note": "n"},
+                                      exact=False, expected="w<", quota=False, card=card)
+    assert wrong.endswith("\n\n" + daily.formatting.card_preview(card)) and "w&lt;" in wrong
+    quota = daily.render_grade_result(None, exact=False, expected="w", quota=True, card=card)
+    assert quota.endswith(daily.formatting.card_preview(card))
+    assert daily.render_grade_result(None, exact=False, expected="w", quota=True).endswith(
+        "сравни свой ответ с правильным)")   # без card — как раньше
+    for verdict in ({"verdict": "correct", "correct": "w", "note": ""},
+                    {"verdict": "typo", "correct": "w", "note": "n"}):
+        assert "🗣" not in daily.render_grade_result(verdict, exact=False, expected="w",
+                                                     quota=False, card=card)
+    assert daily.render_grade_result(None, exact=True, expected="w", quota=False,
+                                     card=card) == "✅ Верно!"
+
+
+async def test_give_hint_mask_only_is_not_cached_and_retries_gemini(conn, monkeypatch):
+    monkeypatch.setattr(hints, "make_hint", lambda *a, **k: None)
+    cid = _card(conn, interval=3, due=TODAY)
+    tid = _open(conn, cid, "recall")
+    bot = FakeBot()
+    await daily.give_hint(bot, conn, None, EN, U, tid)
+    task = db.get_task(conn, tid)
+    assert bot.sent[0][2] == "💡 <code>a h____-__</code>"
+    assert task["hinted"] == 1 and task["hint"] is None
+    monkeypatch.setattr(hints, "make_hint", lambda *a, **k: "Early warning.")
+    await daily.give_hint(bot, conn, None, EN, U, tid)
+    assert bot.sent[1][2] == "💡 Early warning.\n\n<code>a h____-__</code>"
+    assert db.get_task(conn, tid)["hint"] == bot.sent[1][2]
+
+
+async def test_give_hint_gap_passes_phrase_form(conn, monkeypatch):
+    seen = []
+    monkeypatch.setattr(hints, "make_hint", lambda llm, p, card, phrase_form=None:
+                        seen.append(phrase_form) or "x")
+    cid = _card(conn, interval=1, due=TODAY)
+    tid = _open(conn, cid, "gap", phrase_form="gave him a heads-up")
+    await daily.give_hint(FakeBot(), conn, None, EN, U, tid)
+    assert seen == ["gave him a heads-up"]

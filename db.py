@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS daily_tasks (
     answered_ok    INTEGER,
     issued_at      TEXT,
     is_new         INTEGER NOT NULL DEFAULT 0,
-    requested      INTEGER NOT NULL DEFAULT 0
+    requested      INTEGER NOT NULL DEFAULT 0,
+    hinted         INTEGER NOT NULL DEFAULT 0,
+    hint           TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS daily_tasks_one_open
     ON daily_tasks(user_id) WHERE status = 'open';
@@ -83,6 +85,8 @@ _ADDED_COLUMNS = (
     ("daily_tasks", "issued_at", "TEXT"),   # ISO UTC; NULL у старых строк = «не stale»
     ("daily_tasks", "is_new", "INTEGER NOT NULL DEFAULT 0"),  # 1 = первое задание слова
     ("daily_tasks", "requested", "INTEGER NOT NULL DEFAULT 0"),  # 1 = выдано по явному /next
+    ("daily_tasks", "hinted", "INTEGER NOT NULL DEFAULT 0"),  # 1 = ученик взял подсказку
+    ("daily_tasks", "hint", "TEXT"),   # готовый HTML подсказки — второй запрос без Gemini
 )
 
 
@@ -292,6 +296,13 @@ def _transition(conn: sqlite3.Connection, task_id: int, src: str, dst: str,
     )
     conn.commit()
     return cur.rowcount == 1
+
+
+def set_task_hint(conn: sqlite3.Connection, task_id: int, hint_text: str | None) -> None:
+    """Подсказка показана: hinted=1 и её текст (повтор — без Gemini; None — не кэшировать,
+    например только маска). Статус не меняется."""
+    conn.execute("UPDATE daily_tasks SET hinted = 1, hint = ? WHERE id = ?", (hint_text, task_id))
+    conn.commit()
 
 
 def claim_task(conn: sqlite3.Connection, task_id: int) -> bool:

@@ -695,3 +695,41 @@ async def test_cmd_next_tomorrow_with_quota_exhausted_says_real_when(conn, monke
     await daily_handlers.cmd_next(message, conn, None, EN)
     assert message.answer.await_args.args[0] == "Сохранённое сегодня придёт через 2 дня 🙂"
     assert daily.TEXT_NEXT_SAVED_WHEN.format(when="через 2 дня") == message.answer.await_args.args[0]
+
+
+# ---- подсказка (2026-10-11) ----
+
+async def test_free_text_hint_routes_to_give_hint(conn, monkeypatch):
+    give = AsyncMock(return_value="sent")
+    answer = AsyncMock()
+    monkeypatch.setattr(daily, "give_hint", give)
+    monkeypatch.setattr(daily, "answer_task", answer)
+    tid = _task(conn, _card(conn))
+    message = _message("Подскажи?")
+    await daily_handlers.on_free_text(message, _state({}), conn, "LLM", EN)
+    assert give.await_args.args[1:] == (conn, "LLM", EN, U, tid)
+    answer.assert_not_awaited()
+    message.answer.assert_not_awaited()
+
+
+async def test_free_text_hint_on_stale_task_gives_hint_not_clarify(conn, monkeypatch):
+    now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(daily, "_utcnow", lambda: now)
+    give = AsyncMock(return_value="sent")
+    monkeypatch.setattr(daily, "give_hint", give)
+    tid = _next_task(conn, _card(conn, word="span"), issued_at=now - timedelta(minutes=30))
+    state, message = DictState(), _message("hint")
+    await daily_handlers.on_free_text(message, state, conn, None, EN)
+    assert give.await_args.args[-1] == tid
+    message.answer.assert_not_awaited()
+    assert "pending" not in state.data
+
+
+async def test_free_text_hint_without_task_is_capture(conn, monkeypatch):
+    give = AsyncMock()
+    monkeypatch.setattr(daily, "give_hint", give)
+    monkeypatch.setattr(capture, "extract", lambda *a, **k: [])
+    message = _message("hint")
+    await daily_handlers.on_free_text(message, _state({}), conn, None, EN)
+    give.assert_not_awaited()
+    assert message.answer.await_args.args[0] == daily.TEXT_NOTHING_FOUND
