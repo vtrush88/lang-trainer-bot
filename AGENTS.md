@@ -30,7 +30,7 @@ Victoria для теста); данные ключуются по `user_id`.
 
 Python 3.12 · **aiogram 3.13.1** (long-polling, MemoryStorage FSM) · **SQLite** (stdlib) ·
 **google-genai 2.8.0** (`gemini-3.5-flash`, фолбэк `gemini-3.5-flash-lite` — бесплатный тир) · **edge-tts 7.2.8** (`es-ES-XimenaNeural`) ·
-python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **501 тест.**
+python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **569 тестов.**
 
 ## Структура
 
@@ -56,6 +56,7 @@ handlers/daily.py тонкий роутер: /next (только новое сл
 handlers/commands.py команды «/» en-бота (/next /add /vocab /cards /check /listen) — без
                      StateFilter, делегируют в add/menu/training/daily; bot_commands() для меню «/»
 services/sentences.py  Gemini: предложение для задания + check_sentence (проверка ответа)
+services/hints.py      Gemini: подсказка к recall/gap — объяснение слова по-английски без самого слова (сбой → None)
 services/capture.py    Gemini: извлечение фраз из пересланного текста с контекстом
 handlers/menu.py     /start (нижнее меню — keyboards.menu_markup(profile): es — reply-клавиатура,
                      en — ReplyKeyboardRemove), «Мой словарь» (5/стр, тап по номеру →
@@ -92,7 +93,7 @@ cp .env.example .env        # заполнить: TELEGRAM_TOKEN (@BotFather),
                             # GEMINI_API_KEY (Google AI Studio, бесплатно), ALLOWED_USER_IDS (свой tg id)
 python bot.py               # long-polling
 ```
-Тесты: `.venv/bin/pytest -q` (ожидается 501 passed).
+Тесты: `.venv/bin/pytest -q` (ожидается 569 passed).
 Секреты (`.env`), БД (`spanish_bot.db`), `.venv` — в `.gitignore`, не коммитить.
 
 **Деплой на сервер:** пошаговый ран-бук — `docs/superpowers/deploy.md`
@@ -255,7 +256,7 @@ python bot.py               # long-polling
 `docs/superpowers/specs/2026-09-30-daily-practice-design.md` — **с 2026-10-04 продуктовая, простым
 языком** (решение Victoria: спеки пишутся с точки зрения пользователя, вся техника — в плане);
 план `docs/superpowers/plans/2026-10-02-daily-practice.md` — технический дизайн, журнал ревью и дельты
-реализации (а)–(у) живут в его **приложении A**. Правило для новых спек этого репо то же.
+реализации (а)–(ф) живут в его **приложении A**. Правило для новых спек этого репо то же.
 Суть: бот сам пишет утром одно задание по одной фразе (своё предложение / пропуск / вспомнить /
 услышать) в новом предложении в контексте фразы; сбор фраз пересланным текстом; повторы цепочкой
 после ответа; тихий режим после 3 пропусков. Только `BOT_LANG=en` (гейт профилем + `DAILY_AT`);
@@ -267,6 +268,7 @@ es-бот не меняется. Решения брейншторма («не �
 слово; кнопки «Ещё одно» и `MAX_TASKS_PER_DAY` нет. Бизнес-дата — `clock.py`. План
 `docs/superpowers/plans/2026-10-08-daily-scheduling.md`; выкат — `deploy.md`, «Ежедневная практика
 (en-бот)».
+**Подсказка и карточка при ошибке (2026-10-11, в рабочей копии, не закоммичено и не задеплоено; 569 тестов):** «подскажи»/«hint»/«?» в recall/gap → объяснение + маска (`daily.give_hint`, `services/hints.py`, колонки `daily_tasks.hinted/hint`), верный ответ с подсказкой держит ступень; ❌ в recall/gap показывает полную карточку — дельта (ф) плана.
 Хвосты (после деплоя / на финальном ревью ветки):
 - `daily.py` ~590 строк смешивает чистую логику и IO — кандидат на разделение.
 
