@@ -251,7 +251,9 @@ journalctl -u english-bot -n 20     # Start polling, без TelegramConflictErro
 ### Грабли при выкате через `!` из Claude Code (2026-10)
 
 - Команды на сервер — **одной строкой**: терминал переносит длинные команды, и перенос после `printf`
-  или `sudo` ломает цепочку (оба случая были: `printf` без аргументов, `sudo` с usage).
+  или `sudo` ломает цепочку (оба случая были: `printf` без аргументов, `sudo` с usage; 12-10 — перенос
+  между `sqlite3` и именем базы). Рабочий приём: короткий префикс (`ssh … 'sqlite3 <db> "`) и весь длинный
+  хвост внутри двойных кавычек SQL — переносы внутри строки SQL безвредны; рестарт — отдельной короткой командой.
 - sudoers у `spanishbot` разрешает только `systemctl restart|status <unit>`; `stop`/`start` → «Interactive
   authentication required». Для правок базы бот не останавливать — SQLite переживёт запись на ходу,
   потом обычный `restart`.
