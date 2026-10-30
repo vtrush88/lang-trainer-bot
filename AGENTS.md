@@ -29,7 +29,7 @@ Victoria для теста); данные ключуются по `user_id`.
 ## Стек
 
 Python 3.12 · **aiogram 3.13.1** (long-polling, MemoryStorage FSM) · **SQLite** (stdlib) ·
-**google-genai 2.8.0** (`gemini-3.5-flash`, фолбэк `gemini-3.5-flash-lite` — бесплатный тир) · **edge-tts 7.2.8** (`es-ES-XimenaNeural`) ·
+**google-genai 2.8.0** (`gemini-3.5-flash`, фолбэк `gemini-3.5-flash-lite` — бесплатный тир) · **edge-tts 7.3.1** (`es-ES-XimenaNeural`) ·
 python-dotenv · pytest + pytest-asyncio · `languages.py` (профили es/en). **569 тестов.**
 
 ## Структура
@@ -127,8 +127,10 @@ python bot.py               # long-polling
   (с маленькой) его НЕ ловит, и осиротевший процесс (PPID 1) переживёт kill.
 - **Бесплатный тир Gemini: 250 зап./день (flash) + 1000 (flash-lite), лимиты раздельные.** Фолбэк на вторую модель срабатывает и на 429, и на 5xx/обрыв связи (`gemini-3.5-flash` умеет часами отдавать `503 high demand` — наступлено 2026-07-30). Легли все модели: были только 429 → `QuotaExceededError` и мягкая деградация (слово не добавляется / проверка без ИИ-комментария); был хоть один не-429 → `None`, то есть сервисный ретрай и обычное «попробуй ещё раз». Модели меняются в .env без деплоя.
 - **google-genai запинен 2.8.0** — новее требует pydantic≥2.12, конфликт с aiogram 3.13 (<2.10); не поднимать без апгрейда aiogram. `thinking_config` в `generate_json` НЕ задаём: `thinkingBudget=0` возвращает 400 на моделях 3.5+ (наступлено 2026-07-30). И грабля свежих ключей: `gemini-2.5-*` в ListModels числятся, но новым пользователям недоступны (404 «no longer available to new users») — при смене модели проверяй живым вызовом, не списком.
-- **edge-tts должен быть ≥7.x** (`7.2.8`): версия 6.1.12 даёт `WSServerHandshakeError 403`
-  (MS требует токен Sec-MS-GEC).
+- **edge-tts ломается, когда Microsoft меняет токен** — симптом всегда один: `WSServerHandshakeError 403`
+  на `speech.platform.bing.com`, в боте «озвучка временно недоступна». Было дважды: 6.1.12 → 7.x (Sec-MS-GEC),
+  и с 2026-10-10 7.2.8 → 7.3.1 (Sec-MS-GEC v2, релиз 2026-10-13). При 403 сначала смотреть новые релизы
+  `rany2/edge-tts`, проверять живым синтезом (`services.tts.synthesize` в temp-папку), не искать причину в коде.
 - **Озвучка идёт через `answer_voice` (mp3)** — Bot API ≥7.2 принимает MP3 в sendVoice
   напрямую, конвертация в OGG/Opus НЕ нужна. Не переключай на `answer_audio`: «музыкальные»
   аудио объединяются клиентом Telegram в плейлист чата, и проигрывание одного слова

@@ -1,6 +1,6 @@
 aiogram==3.13.1
 google-genai==2.8.0  # НЕ поднимать без апгрейда aiogram: >=2.9 требует pydantic>=2.12, aiogram 3.13 — <2.10
-edge-tts==7.2.8
+edge-tts==7.3.1
 python-dotenv==1.0.1
 pytest==8.3.3
 pytest-asyncio==0.24.0
